@@ -3,6 +3,7 @@
 // Madeira Converter Exception: see LICENSE-EXCEPTION.md
 
 import SwiftUI
+import Combine
 
 // Steam games in the library (docs/LIBRARY.md, "Steam setup", and
 // docs/STEAM_LIBRARY.md): the games Steam has installed in the prefix, which is
@@ -189,13 +190,14 @@ enum SteamGamesRules {
             guard let name, safeAssetName(name) else { return nil }
             return URL(string: assetBase + "\(id)/" + name)
         }
-        func direct(_ id: Int) {
-            add(asset(id, owned(id)?.libraryCapsule))
+        func direct(_ id: Int, info: SteamOwnedGame?) {
+            add(asset(id, info?.libraryCapsule))
             add(cover(id))
         }
-        direct(appID)
-        if let parent = owned(appID)?.parentID, parent != appID { direct(parent) }
-        add(asset(appID, owned(appID)?.headerImage))
+        let info = owned(appID)
+        direct(appID, info: info)
+        if let parent = info?.parentID, parent != appID { direct(parent, info: owned(parent)) }
+        add(asset(appID, info?.headerImage))
         return urls
     }
 }
@@ -364,26 +366,48 @@ enum SteamDirectStart {
     /// written): scan again once it ends.
     private var rescan = false
     private var lastCount = -1
+    private var scanTask: Task<Void, Never>?
+    private var workObserver: AnyCancellable?
+
+    private init() {
+        workObserver = GameSessionWork.shared.$pausesBackgroundWork.dropFirst().sink { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                if GameSessionWork.shared.pausesBackgroundWork {
+                    if self.scanning { self.rescan = true; self.scanTask?.cancel() }
+                } else if self.rescan { self.rescan = false; self.refresh() }
+            }
+        }
+    }
 
     /// Reads the install records again, off the main thread.
     func refresh() {
         guard MadeiraDock.enabled else { return }
+        let work = GameSessionWork.shared, epoch = work.workEpoch
+        guard !work.pausesBackgroundWork else { rescan = true; return }
         guard !scanning else { rescan = true; return }
         scanning = true
         let drive = MadeiraDock.drive
-        Task.detached(priority: .utility) {
+        scanTask = Task.detached(priority: .utility) {
             let found = MadeiraDock.games(drive: drive)
             var builds: [Int: Int] = [:]
             for game in found where SteamInstallPaths.isManaged(library: game.library) && game.installed {
+                if Task.isCancelled { break }
                 if let build = SteamInstallFiles.buildID(appID: game.id, steamApps: SteamInstallPaths.steamApps(drive: drive)) {
                     builds[game.id] = build
                 }
             }
             let recorded = builds
+            let cancelled = Task.isCancelled
             await MainActor.run {
-                self.scanning = false
+                self.scanning = false; self.scanTask = nil
                 let again = self.rescan
                 self.rescan = false
+                guard !cancelled, !work.pausesBackgroundWork, work.workEpoch == epoch else {
+                    self.rescan = true
+                    if !work.pausesBackgroundWork { self.refresh() }
+                    return
+                }
                 if self.games != found { self.games = found }
                 if self.builds != recorded { self.builds = recorded }
                 if found.count != self.lastCount {
@@ -460,6 +484,7 @@ struct SteamGamesSection: View {
     /// Pull to refresh on the library: the install records again and, when
     /// signed in, the account's library.
     @MainActor static func refresh() async {
+        guard !GameSessionWork.shared.pausesBackgroundWork else { return }
         SteamGamesModel.shared.refresh()
         if SteamOwnedLibrary.enabled && SteamOwnedLibrary.shared.signedIn {
             await SteamOwnedLibrary.shared.refreshLibrary(interactive: true)
@@ -562,6 +587,7 @@ struct SteamGamesSection: View {
             }
         }
         .sheet(isPresented: $showSignIn) { SteamSignInView() }
+        .onChange(of: library.runtimePreflightNotice) { _, notice in if notice != nil { selected = nil } }
         .alert("Steam", isPresented: Binding(get: { steam.error != nil }, set: { if !$0 { steam.error = nil } })) {
             Button("OK", role: .cancel) { steam.error = nil }
         } message: { Text(steam.error ?? "") }
@@ -613,6 +639,8 @@ struct SteamGameArtwork: View {
     /// of the art for that glyph to sit on.
     var notDownloaded = false
     @ObservedObject private var steam = SteamOwnedLibrary.shared
+    @Environment(\.displayScale) private var displayScale
+    @Environment(\.libraryScrollFrozenTime) private var scrollFrozenTime
     @State private var index = 0
 
     var body: some View {
@@ -623,12 +651,14 @@ struct SteamGameArtwork: View {
                 if !notDownloaded {
                     Image(systemName: "gamecontroller.fill").font(.largeTitle).foregroundStyle(.secondary)
                 }
-                AsyncImage(url: index < urls.count ? urls[index] : nil) { phase in
+                CachedArtwork(url: index < urls.count ? urls[index] : nil,
+                              maximumPixelSize: ArtworkCache.thumbnailPixelSize(width: geometry.size.width,
+                                  height: geometry.size.height, scale: displayScale)) { phase in
                     switch phase {
                     case .success(let image):
                         image.resizable().scaledToFill()
                             .frame(width: geometry.size.width, height: geometry.size.height).clipped()
-                            .overlay { if notDownloaded { SteamArtworkBlurSpot(image: image, size: geometry.size) } }
+                            .overlay { if notDownloaded && scrollFrozenTime == nil { SteamArtworkBlurSpot(image: image, size: geometry.size) } }
                     case .failure:
                         Color.clear.onAppear { if index + 1 < urls.count { index += 1 } }
                     default:
@@ -823,6 +853,9 @@ struct SteamDownloadStatus: View {
         VStack(alignment: .leading, spacing: 6) {
             ProgressView(value: download.progress.fraction)
             Text(caption).font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            if let notice = download.progress.sourceNotice {
+                Text(notice).font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
     private var caption: String {
@@ -834,12 +867,15 @@ struct SteamDownloadStatus: View {
         case .active:
             switch p.phase {
             case .preparing: return "Preparing download…"
+            case .checking: return "正在校验本地文件；校验通过的内容会保留，不会重复下载…"
             case .finishing: return "Finishing…"
             case .downloading:
-                var parts = ["\(Int(p.fraction * 100))%", "\(formatBytes(Int64(p.doneBytes))) of \(formatBytes(Int64(p.totalBytes)))"]
+                let needed = p.totalBytes - min(p.reusedBytes, p.totalBytes)
+                var parts = ["需补下载 \(formatBytes(Int64(needed)))", "已下载 \(formatBytes(Int64(p.networkBytes)))"]
+                if p.reusedBytes > 0 { parts.append("已保留 \(formatBytes(Int64(p.reusedBytes)))") }
                 if p.bytesPerSecond > 0 {
                     parts.append("\(formatBytes(Int64(p.bytesPerSecond)))/s")
-                    let left = Double(p.totalBytes - min(p.doneBytes, p.totalBytes)) / p.bytesPerSecond
+                    let left = Double(needed - min(p.networkBytes, needed)) / p.bytesPerSecond
                     if left.isFinite, left > 60 { parts.append("about \(Int(left / 60) + 1) min left") }
                 }
                 return parts.joined(separator: " · ")
@@ -863,6 +899,7 @@ struct SteamGameSheet: View {
     @State private var freeSpace: Int64?
     @State private var partial = false
     @State private var confirmCancel = false
+    @State private var prepareRuntime = true
 
     var body: some View {
         let owned = SteamOwnedLibrary.enabled ? steam.owned : []
@@ -899,6 +936,15 @@ struct SteamGameSheet: View {
                         }
                     }
                     Section {
+                        Toggle("下载后检查并修复可支持的运行库", isOn: $prepareRuntime)
+                            .disabled(steam.downloads[appID] != nil)
+                        Text("先校验并补齐游戏文件，再检查实际启动程序的依赖。需要的 Microsoft 运行库会接着准备和安装；如需 JIT 或重启，会单独提示。")
+                            .font(.footnote).foregroundStyle(.secondary)
+                        NavigationLink {
+                            SteamDownloadSettingsView(appID: UInt32(exactly: appID))
+                        } label: {
+                            Label("Download source", systemImage: "network")
+                        }
                         if let freeSpace { LabeledContent("Free space on this device", value: formatBytes(freeSpace)) }
                         Text(SteamGameSheet.downloadNote)
                             .font(.footnote).foregroundStyle(.secondary)
@@ -916,6 +962,7 @@ struct SteamGameSheet: View {
             .navigationTitle("Steam").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
             .task(id: steam.downloads[appID]?.state) {
+                if steam.downloads[appID] != nil { prepareRuntime = steam.preparesRuntimeAfterDownload(appID) }
                 partial = steam.hasPartialDownload(appID)
                 let values = try? URL.documentsDirectory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
                 freeSpace = values?.volumeAvailableCapacityForImportantUsage
@@ -953,8 +1000,8 @@ struct SteamGameSheet: View {
                     .buttonStyle(.borderedProminent)
             }
         } else if item.owned != nil {
-            Button { steam.install(appID) } label: {
-                steamActionLabel(partial ? "Resume download" : "Install", symbol: "arrow.down.circle.fill")
+            Button { steam.install(appID, prepareRuntime: prepareRuntime) } label: {
+                steamActionLabel(partial ? "Resume download" : prepareRuntime ? "下载并准备运行环境" : "Install", symbol: "arrow.down.circle.fill")
             }.buttonStyle(.borderedProminent).disabled(!steam.signedIn)
         }
     }
@@ -984,11 +1031,14 @@ struct SteamCloudQuitRow: View {
     private var working: Bool { if case .working = steam.cloudQuit { return true }; if case .done = steam.cloudQuit { return true }; return false }
 
     private func run(replaceCloud: Bool) {
+        guard let generation = steam.cloudQuitGeneration else { return }
         Task {
+            guard generation == steam.cloudQuitGeneration else { return }
             await steam.uploadForQuit(appID, replaceCloud: replaceCloud)
-            guard case .done(let count) = steam.cloudQuit else { return }
+            guard generation == steam.cloudQuitGeneration, case .done(let count) = steam.cloudQuit else { return }
             LogStore.shared.log("[steam-cloud] app=\(appID) quit-upload done files=\(count): closing Madeira")
-            try? await Task.sleep(nanoseconds: 1_200_000_000)   // long enough to read the result
+            do { try await Task.sleep(nanoseconds: 1_200_000_000) } catch { return } // long enough to read the result
+            guard generation == steam.cloudQuitGeneration, steam.cloudQuit == .done(count) else { return }
             exit(0)
         }
     }
@@ -1062,6 +1112,10 @@ struct SteamCloudSection: View {
             } footer: {
                 Text("Saves sync with Steam Cloud when Madeira starts and when this page opens, not while you play: use Upload saves and close Madeira in the game menu when you stop, or what you played is uploaded the next time Madeira starts. A save that differs on both sides, or that is missing on this device, is never replaced without asking, and a save a sync replaces is kept in Files › Madeira › Steam Cloud Backups.")
             }
+            .task(id: "\(appID) \(steam.signedIn)") {
+                guard steam.signedIn else { return }
+                await steam.syncCloud(appID)
+            }
         }
     }
 
@@ -1085,7 +1139,6 @@ struct SteamCloudSection: View {
             }
         } else {
             Text("Not synced yet.").foregroundStyle(.secondary)
-                .task { await steam.syncCloud(appID) }
             Button("Sync now") { Task { await steam.syncCloud(appID) } }
         }
     }
@@ -1230,9 +1283,9 @@ struct SteamEntrySection: View {
                     .disabled(!steam.signedIn)
             }
             if downloads, download == nil {
-                Button { steam.repair(appID) } label: { Label("Repair installed files", systemImage: "arrow.triangle.2.circlepath") }
+                Button { steam.repair(appID) } label: { Label("校验并补齐游戏文件（可选）", systemImage: "arrow.triangle.2.circlepath") }
                     .disabled(!steam.signedIn)
-                Text("Checks installed content and downloads missing or changed files from the current Steam build.")
+                Text("这是独立工具，不表示当前有故障，也不是运行库修复的下一步。先校验本地文件，仅补下载与当前 Steam 版本不符的内容；可能包含游戏更新。运行库请使用上方“运行环境”。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             LabeledContent("App ID", value: String(appID))

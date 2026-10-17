@@ -85,22 +85,47 @@ final class LibraryController: ObservableObject, @unchecked Sendable {
     private var owns = false
     private var last: UInt16 = 0
     private var announced = false
+    private var controllerTest: UUID?
+    private var commandGeneration: UInt64 = 0
+    private var waitForRelease = false
     private let allowed = MadeiraConfig.flag("MADEIRA_FRONTEND_CONTROLLER")
-    var ownsInput: Bool { lock.lock(); defer { lock.unlock() }; return enabled && owns }
+    var ownsInput: Bool { lock.lock(); defer { lock.unlock() }; return controllerTest != nil || (enabled && owns) }
+    var acceptsCommands: Bool { lock.lock(); defer { lock.unlock() }; return controllerTest == nil }
+    /// A token pauses navigation without releasing the Library's input ownership.
+    /// Configure still records its latest state, so leaving never restores stale state.
+    func beginControllerTest() -> UUID {
+        lock.lock(); defer { lock.unlock() }
+        let token = UUID()
+        controllerTest = token
+        commandGeneration &+= 1
+        return token
+    }
+    func endControllerTest(_ token: UUID) {
+        lock.lock(); defer { lock.unlock() }
+        guard controllerTest == token else { return }
+        controllerTest = nil
+        commandGeneration &+= 1
+        waitForRelease = true
+    }
     func configure(enabled: Bool, ownsInput: Bool) {
         lock.lock(); self.enabled = enabled && allowed; owns = ownsInput; lock.unlock()
     }
     /// One sample of player 1's pad, in XInput button bits and stick units.
     func sample(buttons raw: UInt16, lx: Int16, ly: Int16) {
         lock.lock()
-        guard enabled else { lock.unlock(); return }
+        guard enabled || controllerTest != nil else { lock.unlock(); return }
         var buttons = raw
-        if owns {
+        if owns || controllerTest != nil {
             if lx < -16000 { buttons |= 4 }; if lx > 16000 { buttons |= 8 }
             if ly > 16000 { buttons |= 1 }; if ly < -16000 { buttons |= 2 }
         }
         let pressed = buttons & ~last; last = buttons
+        if controllerTest != nil || waitForRelease {
+            if controllerTest == nil && buttons == 0 { waitForRelease = false }
+            lock.unlock(); return
+        }
         let own = owns, announce = !announced; announced = true
+        let generation = commandGeneration
         lock.unlock()
         if announce { DispatchQueue.main.async { self.connected = true; fputs("[frontend-controller] navigation active\n", stderr) } }
         var command: String?
@@ -111,7 +136,14 @@ final class LibraryController: ObservableObject, @unchecked Sendable {
                 if pressed & mask != 0 { command = name; break }
             }
         }
-        if let command { DispatchQueue.main.async { self.commands.send(command) } }
+        if let command {
+            DispatchQueue.main.async {
+                self.lock.lock()
+                let deliver = self.controllerTest == nil && self.commandGeneration == generation
+                self.lock.unlock()
+                if deliver { self.commands.send(command) }
+            }
+        }
     }
 }
 
@@ -156,6 +188,8 @@ struct LibraryEntry: Codable, Identifiable {
     var title: String
     /// The executable, relative to drive_c ("Games/Foo/foo.exe").
     var relativePath: String
+    /// External entries are relative to a registered Files folder, never drive_c.
+    var externalLibraryID: UUID?
     /// 32 or 64 from the PE header, 0 when unknown.
     var bits: Int
     /// A user-chosen cover in Documents/madeira-art/.
@@ -243,6 +277,9 @@ struct LibraryEntry: Codable, Identifiable {
     /// through Valve's client, with Steam's default launch option.
     /// `relativePath` is then its install folder, relative to drive_c.
     var steamAppID: Int?
+    /// Epic uses a separate identity; old local/Steam library files have none.
+    var epicAppName: String?
+    var epicAccountKey: String?
     /// How a Steam game starts (Game details › Steam › Start with): nil is Madeira
     /// Dock, the default; "game" is the game's own program in Wine, without Steam
     /// (SteamDirectStart).
@@ -417,7 +454,10 @@ struct LibraryEntry: Codable, Identifiable {
         guard startsSteamGameDirectly, let program = steamProgram, !program.isEmpty else { return relativePath }
         return relativePath + "/" + program
     }
-    var launchWindowsPath: String { "C:\\" + launchRelativePath.replacingOccurrences(of: "/", with: "\\") }
+    var launchWindowsPath: String {
+        if let externalLibraryID { return ExternalGameLibrary.windowsPath(root: externalLibraryID, relative: launchRelativePath) }
+        return "C:\\" + launchRelativePath.replacingOccurrences(of: "/", with: "\\")
+    }
     /// "The game"'s working folder as a Windows path, or nil for the program's own folder.
     var steamWorkingWindowsPath: String? {
         guard startsSteamGameDirectly, let folder = steamProgramFolder else { return nil }
@@ -431,13 +471,22 @@ struct LibraryEntry: Codable, Identifiable {
         return entry
     }
 
-    var windowsPath: String { "C:\\" + relativePath.replacingOccurrences(of: "/", with: "\\") }
+    var windowsPath: String {
+        if let externalLibraryID { return ExternalGameLibrary.windowsPath(root: externalLibraryID, relative: relativePath) }
+        return "C:\\" + relativePath.replacingOccurrences(of: "/", with: "\\")
+    }
 
     /// The vsync mode to apply: a saved 30 or 40 FPS limit runs as 60 when it is
     /// not offered (DXMT without that cap would present uncapped).
     var effectiveFPSMode: Int32 { ProMotionIntent.supportedMode(fpsMode) }
 
     func validate() throws {
+        if externalLibraryID != nil {
+            guard steamAppID == nil, epicAppName == nil, epicAccountKey == nil, desktop != true else {
+                throw LibraryError.message("An external game cannot also be a Steam, Epic or Desktop entry.")
+            }
+            try ExternalGameLibrary.validateRelative(relativePath)
+        }
         let size = resolution.split(separator: "x").compactMap { Int($0) }
         guard size.count == 2, (320...4096).contains(size[0]), (240...4096).contains(size[1]),
               (0...4).contains(fpsMode), !arguments.contains("\0"), !windowsPath.contains("\0"),
@@ -643,6 +692,7 @@ final class LibraryModel: ObservableObject {
     // exited with a Windows error (wine_crash_exit_status, WineProcessBridge.m).
     // MADEIRA_EXIT_REPORT=0 returns to the library without a message.
     private var quitRequested = false
+    private var dockCloseGate: DockSessionCloseGate?
     private func exitReport() -> String? {
         guard !quitRequested, MadeiraConfig.flag("MADEIRA_EXIT_REPORT") else { return nil }
         var status: UInt32 = 0
@@ -654,6 +704,15 @@ final class LibraryModel: ObservableObject {
     private var readOnly = false
     private var metadataInFlight = Set<UUID>()
     private var steamMetadataInFlight = Set<Int>()
+    private var metadataTasks: [UUID: Task<(bytes: Int64?, api: String?), Never>] = [:]
+    private var steamMetadataTasks: [Int: Task<(bytes: Int64?, api: String?), Never>] = [:]
+
+    @MainActor func pauseOptionalWork(_ paused: Bool) {
+        if paused {
+            metadataTasks.values.forEach { $0.cancel() }
+            steamMetadataTasks.values.forEach { $0.cancel() }
+        }
+    }
     private var savedControls: [TouchControl] = []
     private var savedLayout: String?
     private var savedVisible = true
@@ -708,6 +767,14 @@ final class LibraryModel: ObservableObject {
 
     func save(_ entry: LibraryEntry) {
         guard !readOnly else { error = "The library file could not be read. Preserve or repair it before making changes."; return }
+        if entry.externalLibraryID != nil, entry.steamAppID != nil || entry.epicAppName != nil || entry.epicAccountKey != nil || entry.desktop == true {
+            error = "An external game cannot also be a Steam, Epic or Desktop entry."; return
+        }
+        if let existing = entries.first(where: { $0.id == entry.id }),
+           existing.externalLibraryID != entry.externalLibraryID,
+           existing.externalLibraryID != nil || entry.externalLibraryID != nil {
+            error = "This game belongs to a different library folder. Add it as a separate game."; return
+        }
         var next = entries
         var entry = entry
         // A Steam game has one entry: a details page opened before its card first saved
@@ -771,13 +838,20 @@ final class LibraryModel: ObservableObject {
     @MainActor
     func refreshMetadata(_ id: UUID) async {
         let revision = 12
-        guard !metadataInFlight.contains(id), let entry = entries.first(where: { $0.id == id }), entry.desktop != true,
-              entry.metadataRevision != revision || Date().timeIntervalSince(entry.metadataChecked ?? .distantPast) > 86400,
-              let url = try? Self.executable(entry.relativePath) else { return }
+        let work = GameSessionWork.shared, epoch = work.workEpoch
+        guard !work.pausesBackgroundWork, !metadataInFlight.contains(id), let entry = entries.first(where: { $0.id == id }), entry.desktop != true,
+              entry.metadataRevision != revision || Date().timeIntervalSince(entry.metadataChecked ?? .distantPast) > 86400 else { return }
+        let lease = entry.externalLibraryID.flatMap { try? ExternalGameLibrary.shared.acquire($0) }
+        defer { lease?.release() }
+        guard let url = try? Self.executable(for: entry, lease: lease) else { return }
         metadataInFlight.insert(id)
-        defer { metadataInFlight.remove(id) }
-        let result = await LibraryMetadataScanner.shared.scan(url, drive: Self.drive)
-        guard !Task.isCancelled, var updated = entries.first(where: { $0.id == id }) else { return }
+        defer { metadataInFlight.remove(id); metadataTasks.removeValue(forKey: id) }
+        let boundary = lease?.root ?? Self.drive
+        let scan = Task { await LibraryMetadataScanner.shared.scan(url, drive: boundary, allowRootFolder: entry.externalLibraryID != nil) }
+        metadataTasks[id] = scan
+        let result = await withTaskCancellationHandler { await scan.value } onCancel: { scan.cancel() }
+        guard !Task.isCancelled, !scan.isCancelled, !work.pausesBackgroundWork, work.workEpoch == epoch,
+              var updated = entries.first(where: { $0.id == id }) else { return }
         updated.folderBytes = result.bytes
         if let api = result.api { updated.graphicsAPI = api }
         updated.metadataChecked = Date(); updated.metadataRevision = revision; save(updated)
@@ -793,9 +867,10 @@ final class LibraryModel: ObservableObject {
     @MainActor
     func refreshSteamMetadata(_ game: DockGame, title: String) async {
         let revision = 1
-        guard !readOnly, game.installed, !steamMetadataInFlight.contains(game.id) else { return }
+        let work = GameSessionWork.shared, epoch = work.workEpoch
+        guard !work.pausesBackgroundWork, !readOnly, game.installed, !steamMetadataInFlight.contains(game.id) else { return }
         steamMetadataInFlight.insert(game.id)
-        defer { steamMetadataInFlight.remove(game.id) }
+        defer { steamMetadataInFlight.remove(game.id); steamMetadataTasks.removeValue(forKey: game.id) }
         let drive = Self.drive
         let folder = game.library + "/common/" + game.installDir
         let root = drive.appendingPathComponent(folder, isDirectory: true)
@@ -804,6 +879,7 @@ final class LibraryModel: ObservableObject {
             (build: SteamInstallFiles.buildID(appID: game.id, steamApps: steamApps),
              size: SteamInstallFiles.sizeOnDisk(appID: game.id, steamApps: steamApps))
         }.value
+        guard !Task.isCancelled, !work.pausesBackgroundWork, work.workEpoch == epoch else { return }
         let stored = entries.first { $0.steamAppID == game.id }
         let picked = stored?.steamProgramSource == "choice" ? stored?.steamProgram : nil
         let known = SteamOwnedLibrary.shared.game(game.id)?.launches != nil
@@ -812,15 +888,24 @@ final class LibraryModel: ObservableObject {
            stored.bits != 0 || Date().timeIntervalSince(stored.metadataChecked ?? .distantPast) < 86400 { return }
         // Steam's launch configuration is asked for only when no picked program is installed.
         let kept = await Task.detached(priority: .utility) { picked.flatMap { SteamDirectStart.onDisk($0, in: root, directory: false) } }.value
+        guard !Task.isCancelled, !work.pausesBackgroundWork, work.workEpoch == epoch else { return }
         let options = kept == nil ? await SteamOwnedLibrary.shared.launchOptions(appID: game.id) : nil
+        guard !Task.isCancelled, !work.pausesBackgroundWork, work.workEpoch == epoch else { return }
         let program = await Task.detached(priority: .utility) { () -> (url: URL, bits: Int, api: String?)? in
             guard let path = SteamDirectStart.program(picked: kept, options: options, installFolder: root),
                   let inspected = try? LibraryModel.inspect(root.appendingPathComponent(path)) else { return nil }
             return (root.appendingPathComponent(path), inspected.bits, inspected.graphicsAPI)
         }.value
+        guard !Task.isCancelled, !work.pausesBackgroundWork, work.workEpoch == epoch else { return }
         var api = program?.api
-        if let program, let scanned = await LibraryMetadataScanner.shared.scan(program.url, drive: drive, countBytes: false).api { api = scanned }
-        guard !Task.isCancelled else { return }
+        if let program {
+            let scan = Task { await LibraryMetadataScanner.shared.scan(program.url, drive: drive, countBytes: false) }
+            steamMetadataTasks[game.id] = scan
+            let result = await withTaskCancellationHandler { await scan.value } onCancel: { scan.cancel() }
+            if let scanned = result.api { api = scanned }
+            guard !scan.isCancelled else { return }
+        }
+        guard !Task.isCancelled, !work.pausesBackgroundWork, work.workEpoch == epoch else { return }
         var updated = entries.first { $0.steamAppID == game.id } ?? LibraryEntry(title: title, relativePath: folder, bits: 0)
         updated.steamAppID = game.id
         updated.relativePath = folder
@@ -843,17 +928,33 @@ final class LibraryModel: ObservableObject {
         }
         return url
     }
-    static func inspect(_ url: URL) throws -> LibraryEntry {
-        guard url.resolvingSymlinksInPath().path.hasPrefix(drive.path + "/") else {
+    static func executable(for entry: LibraryEntry, lease: ExternalGameLease? = nil) throws -> URL {
+        guard entry.externalLibraryID != nil else { return try executable(entry.launchRelativePath) }
+        guard entry.steamAppID == nil, entry.epicAppName == nil, entry.epicAccountKey == nil, entry.desktop != true,
+              let lease, lease.isActive, lease.libraryID == entry.externalLibraryID else { throw ExternalGameLibrary.Failure.unavailable }
+        return try ExternalGameLibrary.resolve(entry.relativePath, inside: lease.root, directory: false)
+    }
+    static func withExecutable<T>(for entry: LibraryEntry, _ body: (URL) throws -> T) throws -> T {
+        let lease = try entry.externalLibraryID.map { try ExternalGameLibrary.shared.acquire($0) }
+        defer { lease?.release() }
+        return try body(executable(for: entry, lease: lease))
+    }
+    static func inspect(_ url: URL, externalLibraryID: UUID? = nil, lease: ExternalGameLease? = nil) throws -> LibraryEntry {
+        let boundary = externalLibraryID == nil ? drive : lease?.root
+        guard let boundary, externalLibraryID == nil || (lease?.isActive == true && lease?.libraryID == externalLibraryID),
+              url.resolvingSymlinksInPath().path.hasPrefix(boundary.path + "/") else {
             throw LibraryError.message("The executable must be inside drive_c.")
         }
+        let relative = String(url.resolvingSymlinksInPath().path.dropFirst(boundary.path.count + 1))
+        if externalLibraryID != nil { _ = try ExternalGameLibrary.resolve(relative, inside: boundary, directory: false) }
         if ["bat", "cmd"].contains(url.pathExtension.lowercased()) {
             // ml1163: a batch file has no PE header. Like every entry it starts
             // directly by default, as upstream starts every game; the details page
             // warns that Wine then stops when cmd.exe, its first process, exits.
-            let relative = String(url.resolvingSymlinksInPath().path.dropFirst(drive.path.count + 1))
-            return LibraryEntry(title: url.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "_", with: " "),
-                                relativePath: relative, bits: 0)
+            var entry = LibraryEntry(title: url.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "_", with: " "),
+                                     relativePath: relative, bits: 0)
+            entry.externalLibraryID = externalLibraryID
+            return entry
         }
         let h = try FileHandle(forReadingFrom: url); defer { try? h.close() }
         let dos = try h.read(upToCount: 64) ?? Data()
@@ -865,9 +966,9 @@ final class LibraryModel: ObservableObject {
         guard pe.count == 6, Array(pe.prefix(4)) == [0x50, 0x45, 0, 0] else { throw LibraryError.message("Missing PE header.") }
         let machine = Int(pe[4]) | Int(pe[5]) << 8
         guard machine == 0x14c || machine == 0x8664 else { throw LibraryError.message("Only x86 and x64 executables are supported.") }
-        let relative = String(url.resolvingSymlinksInPath().path.dropFirst(drive.path.count + 1))
         let name = url.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "_", with: " ")
         var entry = LibraryEntry(title: name, relativePath: relative, bits: machine == 0x14c ? 32 : 64)
+        entry.externalLibraryID = externalLibraryID
         entry.graphicsAPI = graphicsImports(url)
         return entry
     }
@@ -975,6 +1076,9 @@ final class LibraryModel: ObservableObject {
     var cloudBypass: Int?
     /// The entry whose details page the library should open (the notice's "Choose").
     @Published var showDetail: UUID?
+    /// Root-owned runtime preflight closes details before presenting its sheet.
+    @Published var runtimePreflightNotice: UUID?
+    @Published var runtimeCheckEntry: UUID?
 
     /// `remember: false` runs a session that is not a library entry (a Madeira
     /// Dock start): it is neither added to the library nor stamped as played.
@@ -982,14 +1086,21 @@ final class LibraryModel: ObservableObject {
     func begin(_ entry: LibraryEntry, remember: Bool = true, dock: DockGame? = nil) {
         wine_exit_status_reset()
         quitRequested = false
+        if dock != nil {
+            let id = UUID()
+            MainActor.assumeIsolated { MadeiraDock.beginReportSession(id) }
+            dockCloseGate = DockSessionCloseGate(sessionID: id, baselineToken: winios_control_session_token())
+        } else { dockCloseGate = nil }
         LibraryController.shared.configure(enabled: enabled, ownsInput: false)
         Self.sessionsThisRun += 1
         launchPresent = madeira_get_present_count(); launchStarted = Date(); launchSlow = false; launchLogs = entry.liveLogs
         launchSurface = winios_surface_present_count()
         MetalBackedView.presentCountAtLaunch = launchPresent; laidOutAfterFirstPresent = false
-        launching = true; overlayFields = entry.overlayFields ?? ["FPS", "Frame time", "RAM", "Battery"]
+        launching = true
+        configurePerformanceOverlay()
         displayMode = entry.displayMode
-        activeEntry = entry; current = entry.id; menu = false; performance = entry.performance; liveLogs = entry.liveLogs
+        activeEntry = entry; current = entry.id; menu = false; liveLogs = entry.liveLogs
+        MainActor.assumeIsolated { GameSessionWork.shared.reconcile() }
         LogStore.shared.setDisplayActive(entry.liveLogs)
         fpsMode = entry.fpsMode; sessionMessage = "Starting…"
         opacity = min(max(entry.controlOpacity ?? 0.7, 0.15), 1)
@@ -1035,7 +1146,18 @@ final class LibraryModel: ObservableObject {
                 showGameView(reason: "surface")
             } else if Date().timeIntervalSince(launchStarted) > 30 { launchSlow = true }
         }
-        if wine_process_is_running() != 0 {
+        let wineRunning = wine_process_is_running() != 0
+        if var gate = dockCloseGate {
+            let report = MainActor.assumeIsolated { MadeiraDock.pollReport() }
+            if let token = gate.request(reportSessionID: report.sessionID, fields: report.fields,
+                                        controlToken: winios_control_session_token(), wineRunning: wineRunning),
+               winios_request_desktop_close(token) != 0 {
+                gate.queued(token: token)
+                fputs("[frontend] completed Dock requested owned desktop WM_CLOSE\n", stderr)
+            }
+            dockCloseGate = gate
+        }
+        if wineRunning {
             sawProcess = true
             if sessionMessage == "Starting…" { sessionMessage = "" }
         } else if sawProcess && wineserver_is_running() == 0 { finish() }
@@ -1117,14 +1239,21 @@ final class LibraryModel: ObservableObject {
         menu = false
         fputs("[frontend] graceful close requested\n", stderr)
     }
+    func configurePerformanceOverlay(defaults: UserDefaults = .standard) {
+        let selection = GlobalPerformanceOverlay.read(defaults: defaults)
+        performance = selection.enabled
+        overlayFields = selection.fields
+    }
+
     func saveCurrentProfile() {
         let controls = TouchControlsModel.shared
         if let id = current, var entry = entries.first(where: { $0.id == id }) {
             entry.controls = controls.controls
             if ControlPresetsModel.enabled { entry.controlLayout = controls.layoutID }
             entry.touchControls = controls.visible
-            entry.fpsMode = fpsMode; entry.performance = performance
-            entry.overlayFields = overlayFields
+            entry.fpsMode = fpsMode
+            // Performance information is global. Session menu adjustments are
+            // temporary and must not overwrite this game's historical settings.
             entry.controlOpacity = opacity; entry.controlSize = controls.sizeScale
             if GamepadInput.keyboardMouseAvailable { entry.controllerMode = controllerMode }
             if GamepadInput.keyboardMouseAvailable { entry.controllerBinds = controllerBinds.isEmpty ? nil : controllerBinds }
@@ -1136,6 +1265,7 @@ final class LibraryModel: ObservableObject {
         }
     }
     private func finish() {
+        dockCloseGate = nil
         if sawProcess, let report = exitReport() { error = report }
         timer?.invalidate(); timer = nil
         saveCurrentProfile()
@@ -1147,6 +1277,7 @@ final class LibraryModel: ObservableObject {
         controls.controls = savedControls; controls.visible = savedVisible; controls.sizeScale = savedSize
         if ControlPresetsModel.enabled { controls.layoutID = savedLayout }
         current = nil; activeEntry = nil; menu = false; sessionMessage = ""
+        MainActor.assumeIsolated { GameSessionWork.shared.reconcile() }
         displayMode = .fit
         LogStore.shared.setDisplayActive(true)
         launching = false; launchLogs = false; LibraryKeyboard.hide()
@@ -1196,9 +1327,10 @@ private actor LibraryMetadataScanner {
         return result
     }
     /// `countBytes: false` skips the size walk (a Steam game's size is its install record's).
-    func scan(_ executable: URL, drive: URL, countBytes: Bool = true) -> (bytes: Int64?, api: String?) {
+    func scan(_ executable: URL, drive: URL, countBytes: Bool = true, allowRootFolder: Bool = false) -> (bytes: Int64?, api: String?) {
         let folder = executable.deletingLastPathComponent()
-        guard folder.path.hasPrefix(drive.path + "/"), !Task.isCancelled else { return (nil, nil) }
+        guard folder.path.hasPrefix(drive.path + "/") || (allowRootFolder && folder.path == drive.path),
+              !Task.isCancelled else { return (nil, nil) }
         let manager = FileManager.default
         // Executables commonly live below the installation root. Only ascend
         // conventional binary directories, never an arbitrary library parent.
@@ -1226,7 +1358,12 @@ private actor LibraryMetadataScanner {
         }
         // Engines often import graphics through a local DLL. Follow only their
         // actual import graph, case-insensitively, never every DLL in drive_c.
-        let siblings = (try? manager.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+        var siblings: [URL] = []
+        let immediate = manager.enumerator(at: folder, includingPropertiesForKeys: nil, options: [.skipsSubdirectoryDescendants, .skipsHiddenFiles])
+        for _ in 0..<512 {
+            guard !Task.isCancelled, let file = immediate?.nextObject() as? URL else { break }
+            siblings.append(file)
+        }
         var local: [String: URL] = [:]
         for file in siblings where file.pathExtension.lowercased() == "dll" {
             if file.resolvingSymlinksInPath().path.hasPrefix(drive.path + "/") { local[file.lastPathComponent.lowercased()] = file }
@@ -1243,6 +1380,8 @@ private actor LibraryMetadataScanner {
         }
         while let file = pending.popLast(), visited.count < 64, !Task.isCancelled {
             if !visited.insert(file.path).inserted { continue }
+            guard ExternalGameLibrary.contains(file.resolvingSymlinksInPath(), in: drive),
+                  (try? file.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true else { continue }
             let imports = LibraryModel.importNames(file)
             apis.formUnion(LibraryModel.apiNames(imports))
             apis.formUnion(dynamicAPIs(file, budget: &budget))
@@ -1312,12 +1451,29 @@ struct LibraryTitleText: View {
 /// Whether JIT is available (the debugger is attached), checked every 2 s like
 /// LibraryStatus. Shared by the title's bolt and the Enable JIT buttons, which
 /// are disabled once it is.
-final class LibraryJITState: ObservableObject {
+@MainActor final class LibraryJITState: ObservableObject {
     static let shared = LibraryJITState()
     @Published private(set) var enabled = StikJITHelper.ready
     private var timer: Timer?
+    private var visible = false
+    private var workObserver: AnyCancellable?
     private init() {
-        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+        workObserver = GameSessionWork.shared.$pausesBackgroundWork.sink { [weak self] _ in
+            Task { @MainActor in self?.updateTimer() }
+        }
+    }
+    @MainActor func setVisible(_ value: Bool) {
+        visible = value; updateTimer()
+        if value { refresh() }
+    }
+    @MainActor private func updateTimer() {
+        guard visible, !GameSessionWork.shared.pausesBackgroundWork else {
+            timer?.invalidate(); timer = nil; return
+        }
+        guard timer == nil else { return }
+        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refresh() }
+        }
         RunLoop.main.add(timer, forMode: .common)   // keeps ticking while a list scrolls
         self.timer = timer
     }
@@ -1586,10 +1742,12 @@ struct LibraryArtwork: View {
                 Image(uiImage: image).resizable().scaledToFill()
                     .frame(width: geometry.size.width, height: geometry.size.height, alignment: .center).clipped()
             } else if let id = entry.steamID ?? entry.steamAppID {   // a store match, else the Steam game itself
-                AsyncImage(url: backdrop ? SteamCatalog.hero(id) : SteamCatalog.cover(id)) { image in
-                    image.resizable().scaledToFill()
-                        .frame(width: geometry.size.width, height: geometry.size.height, alignment: .center).clipped()
-                } placeholder: { Color.clear }
+                CachedArtwork(url: backdrop ? SteamCatalog.hero(id) : SteamCatalog.cover(id)) { phase in
+                    if case .success(let image) = phase {
+                        image.resizable().scaledToFill()
+                            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .center).clipped()
+                    } else { Color.clear }
+                }
             }
         }
         .frame(width: geometry.size.width, height: geometry.size.height)
@@ -1757,6 +1915,39 @@ struct AmbientRays: View {
 /// those masks, a slight hue drift and the rays' sway move, at 30 frames a second.
 /// Dark appearance adds the light (plusLighter), as light does on a dark wall; light
 /// appearance tints more softly. Reduce Motion holds it still.
+struct LibraryScrollVisualState {
+    private(set) var frozenTime: Double?
+    mutating func phaseChanged(isIdle: Bool, at time: Double) {
+        if isIdle { frozenTime = nil }
+        else if frozenTime == nil { frozenTime = time }
+    }
+}
+
+private struct LibraryScrollTimeKey: EnvironmentKey {
+    static let defaultValue: Double? = nil
+}
+
+extension EnvironmentValues {
+    var libraryScrollFrozenTime: Double? {
+        get { self[LibraryScrollTimeKey.self] }
+        set { self[LibraryScrollTimeKey.self] = newValue }
+    }
+}
+
+private struct LibraryScrollActivity: ViewModifier {
+    @State private var visual = LibraryScrollVisualState()
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content
+                .onScrollPhaseChange { _, phase in
+                    visual.phaseChanged(isIdle: phase == .idle, at: Date().timeIntervalSinceReferenceDate)
+                }
+                .onDisappear { visual.phaseChanged(isIdle: true, at: 0) }
+                .environment(\.libraryScrollFrozenTime, visual.frozenTime)
+        } else { content }
+    }
+}
+
 struct AmbientGlow: View {
     let image: Image
     let size: CGSize
@@ -1768,6 +1959,7 @@ struct AmbientGlow: View {
     var pressed = false
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.libraryScrollFrozenTime) private var scrollFrozenTime
 
     private func layer(_ angle: Double, _ mirror: Bool, frame: CGSize) -> some View {
         func art() -> some View {
@@ -1799,8 +1991,8 @@ struct AmbientGlow: View {
         // A game that is not installed throws a fainter, less vivid light.
         let strength = (dark ? 0.92 : 0.8) * (dimmed ? 0.3 : 1)
         let plain = layer(0, false, frame: frame), turned = layer(180, false, frame: frame), mirrored = layer(0, true, frame: frame)
-        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion)) { context in
-            let t = context.date.timeIntervalSinceReferenceDate
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion || scrollFrozenTime != nil)) { context in
+            let t = scrollFrozenTime ?? context.date.timeIntervalSinceReferenceDate
             let f = movie.frame(at: reduceMotion ? 0 : t)
             ZStack {
                 plain
@@ -1930,9 +2122,8 @@ enum AmbientArtwork {
     }
 
     private static func fetch(_ url: URL) async -> UIImage? {
-        guard let (data, response) = try? await URLSession.shared.data(from: url),
-              (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-        return UIImage(data: data)
+        guard let bitmap = try? await ArtworkCache.shared.bitmap(for: url, maximumPixelSize: 144) else { return nil }
+        return UIImage(cgImage: bitmap)
     }
 }
 
@@ -2031,6 +2222,7 @@ struct LibraryBadges: View {
         HStack(spacing: 4) {
             if entry.bits == 32 || entry.bits == 64 { badge("\(entry.bits)-bit") }
             if entry.isBatch { badge("Batch") }   // ml1163
+            if entry.externalLibraryID != nil { badge("External drive") }
             if let api = LibraryRendererBadge.compact(entry.graphicsAPI) { badge(api) }
             if let note { badge(note) }
         }
@@ -2147,11 +2339,12 @@ struct LibraryCells<Item: Identifiable, Cell: View>: View {
 /// added and Steam's games together, each group in the library's Sort by order.
 enum LibraryGrouping {
     enum Source: Hashable {
-        case entry(UUID), steam(Int)
+        case entry(UUID), steam(Int), epic(String)
         var key: String {
             switch self {
             case .entry(let id): return "entry:" + id.uuidString
             case .steam(let appID): return "steam:\(appID)"
+            case .epic(let appName): return "epic:" + appName
             }
         }
     }
@@ -2265,9 +2458,11 @@ struct LibraryGroupedGames<LocalCell: View>: View {
     @ObservedObject private var library = LibraryModel.shared
     @ObservedObject private var steamGames = SteamGamesModel.shared
     @ObservedObject private var steam = SteamOwnedLibrary.shared
+    @ObservedObject private var epic = EpicLibraryModel.shared
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("madeiraLibraryCollapsedGroups") private var collapsedGroups = ""
     @State private var steamSheet: SteamSelection?
+    @State private var epicSheet: EpicGame?
 
     private struct SteamSelection: Identifiable { let id: Int }
 
@@ -2275,6 +2470,7 @@ struct LibraryGroupedGames<LocalCell: View>: View {
         var games: [LibraryGrouping.Game] = []
         var entries: [UUID: LibraryEntry] = [:]
         var steam: [Int: SteamGamesRules.Item] = [:]
+        var epic: [String: EpicGame] = [:]
     }
 
     private var sources: Sources {
@@ -2283,7 +2479,7 @@ struct LibraryGroupedGames<LocalCell: View>: View {
         var steamEntries: [Int: (position: Int, entry: LibraryEntry)] = [:]
         for (position, entry) in library.entries.enumerated() where entry.desktop != true {
             if let appID = entry.steamAppID { steamEntries[appID] = (position, entry) }
-            else if query.isEmpty || entry.title.localizedCaseInsensitiveContains(query) {
+            else if (!EpicGamesSection.enabled || entry.epicAppName == nil) && (query.isEmpty || entry.title.localizedCaseInsensitiveContains(query)) {
                 result.entries[entry.id] = entry
                 result.games.append(LibraryGrouping.Game(entry: entry, position: position))
             }
@@ -2302,6 +2498,17 @@ struct LibraryGroupedGames<LocalCell: View>: View {
                 result.games.append(LibraryGrouping.Game(source: .steam(item.id), title: item.name, installed: installed,
                                                          lastPlayed: [recorded?.entry.lastPlayed, steamPlayed].compactMap { $0 }.max(),
                                                          bytes: recorded?.entry.folderBytes, position: recorded?.position))
+            }
+        }
+        if EpicGamesSection.enabled {
+            var seen = Set<String>()
+            for game in epic.visibleInstallations.map(\.game) + epic.visibleDownloads.map(\.game) + epic.games {
+                guard seen.insert(game.id).inserted, query.isEmpty || game.title.localizedCaseInsensitiveContains(query) else { continue }
+                let entry = library.entries.first { $0.epicAppName == game.id && ($0.epicAccountKey == epic.accountKey || epic.accountKey == nil) }
+                result.epic[game.id] = game
+                result.games.append(LibraryGrouping.Game(source: .epic(game.id), title: game.title,
+                    installed: epic.installed(game.id) != nil, lastPlayed: entry?.lastPlayed,
+                    bytes: entry?.folderBytes, position: entry.flatMap { found in library.entries.firstIndex { $0.id == found.id } }))
             }
         }
         return result
@@ -2338,6 +2545,7 @@ struct LibraryGroupedGames<LocalCell: View>: View {
         .onAppear {
             steamGames.refresh()
             if SteamOwnedLibrary.enabled { steam.start(); steam.reconcileSession() }
+            if EpicGamesSection.enabled { epic.refresh() }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { steamGames.refresh(); if SteamOwnedLibrary.enabled { steam.reconcileSession() } }
@@ -2347,6 +2555,10 @@ struct LibraryGroupedGames<LocalCell: View>: View {
                 // Let the download sheet finish dismissing before presenting the details page.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { open(entry) }
             }
+        }
+        .onChange(of: library.runtimePreflightNotice) { _, notice in if notice != nil { steamSheet = nil } }
+        .sheet(item: $epicSheet) { game in
+            EpicGameSheet(game: game) { entry in DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { open(entry) } }
         }
         .alert("Steam", isPresented: Binding(get: { steam.error != nil }, set: { if !$0 { steam.error = nil } })) {
             Button("OK", role: .cancel) { steam.error = nil }
@@ -2373,6 +2585,13 @@ struct LibraryGroupedGames<LocalCell: View>: View {
                 } label: { SteamGameCell(item: item, list: list, dense: dense) }
                     .libraryCardButtonStyle(grid: !list)
             }
+        case .epic(let name):
+            if let game = sources.epic[name] {
+                Button {
+                    if let installed = epic.installed(name) { open(library.epicEntry(installed)) }
+                    else { epicSheet = game }
+                } label: { EpicGameCell(game: game, list: list, dense: dense) }.libraryCardButtonStyle(grid: !list)
+            }
         }
     }
 }
@@ -2395,6 +2614,7 @@ struct LibraryView: View {
         jit.connectionProblem.flatMap { model.error == $0.message ? $0 : nil }
     }
     @State private var browser = false
+    @State private var externalBrowser = false
     @State private var selected: LibraryEntry?
     @State private var search = ""
     /// The Settings tab's own search text, kept apart from the library's.
@@ -2419,7 +2639,7 @@ struct LibraryView: View {
     @ObservedObject private var steamLibrary = SteamOwnedLibrary.shared
     private var entries: [LibraryEntry] {
         // Steam games are listed in their own section (SteamGames.swift).
-        let visible = model.entries.filter { $0.desktop != true && $0.steamAppID == nil && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
+        let visible = model.entries.filter { $0.desktop != true && $0.steamAppID == nil && (!EpicGamesSection.enabled || $0.epicAppName == nil) && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
         if sort == "added" { return visible.reversed() }
         return visible.sorted {
             if sort == "played", $0.lastPlayed != $1.lastPlayed { return ($0.lastPlayed ?? .distantPast) > ($1.lastPlayed ?? .distantPast) }
@@ -2495,10 +2715,10 @@ struct LibraryView: View {
         // observer, display link and view walks kept running on the main thread through
         // the whole game. Stop with the library; it starts again when the library returns
         // on either tab (start() does nothing while liquid metal is off).
-        .onAppear { GlassSkin.shared.start() }
-        .onDisappear { GlassSkin.shared.stop() }
+        .onAppear { GlassSkin.shared.start(); jitState.setVisible(true) }
+        .onDisappear { GlassSkin.shared.stop(); jitState.setVisible(false) }
         .onReceive(controller.commands) { command in
-            if selected == nil, !browser, !onboarding.presented, command == "tab" { switchTab(to: 1 - tab) }
+            if controller.acceptsCommands, selected == nil, !browser, !externalBrowser, !onboarding.presented, command == "tab" { switchTab(to: 1 - tab) }
         }
     }
     @ToolbarContentBuilder private var libraryToolbar: some ToolbarContent {
@@ -2524,7 +2744,12 @@ struct LibraryView: View {
                 }
             } label: { Label("Library options", systemImage: "line.3.horizontal.decrease") }
         }
-        ToolbarItem(placement: .topBarTrailing) { Button { browser = true } label: { Label("Add executable", systemImage: "plus") } }
+        ToolbarItem(placement: .topBarTrailing) {
+            Menu {
+                Button { browser = true } label: { Label("Add executable", systemImage: "plus") }
+                Button { externalBrowser = true } label: { Label("External game library", systemImage: "externaldrive") }
+            } label: { Label("Add game", systemImage: "plus") }
+        }
     }
     @ToolbarContentBuilder private var settingsToolbar: some ToolbarContent {
         ToolbarItem(placement: .topBarTrailing) {
@@ -2561,8 +2786,21 @@ struct LibraryView: View {
                     Toggle("Extended logging", isOn: $input.diagnostics)
                 } header: { Text("Diagnostics") }
             }
+            if settingsShow("performance", "FPS", "frame time", "CPU", "GPU", "RAM", "battery", "thermal") {
+                PerformanceOverlaySettingsSection()
+            }
             if settingsShow("pointer", "mouse", "cursor", "touch", "trackpad", "sensitivity") {
                 Section("Pointer") { LibraryPointerSettings() }
+            }
+            if settingsShow("input", "controller", "gamepad", "Xbox", "buttons", "test") {
+                Section {
+                    Button { settingsSheet = .controllerTest } label: {
+                        Label("Controller test", systemImage: "gamecontroller")
+                    }
+                    .disabled(model.current != nil || wine_process_is_running() != 0 || wineserver_is_running() != 0)
+                } header: { Text("Input") } footer: {
+                    Text("Test a physical controller's buttons, sticks and triggers. End the current Windows session before testing.")
+                }
             }
             if MadeiraConfig.flag("MADEIRA_RUNTIME_SETTINGS") {
                 if settingsShow("display", "refresh", "rate", "ProMotion", "120 Hz") { DisplayRateSettings() }
@@ -2570,11 +2808,23 @@ struct LibraryView: View {
                     RuntimeMemorySyncSettings(open: { settingsSheet = $0 }, refresh: settingsRefresh)
                 }
             }
-            if SteamSettingsSection.shown, settingsShow("Steam", "Dock", "sign in", "account", "setup") {
+            if SteamSettingsSection.shown, settingsShow("Steam", "Dock", "sign in", "account", "setup", "download source", "CDN", "node") {
                 SteamSettingsSection(open: { settingsSheet = $0 })
+            }
+            if EpicGamesSection.enabled, settingsShow("Epic", "Epic Games", "sign in", "account", "download") {
+                EpicSettingsSection(open: { settingsSheet = $0 })
             }
             if settingsShow(".NET", "Mono", "Wine Mono", "framework", "download") { WineMonoSettingsSection() }
             if settingsShow("saves", "backup", "restore", "save games") { SavesSection() }
+            if settingsShow("iCloud", "local saves", "upload", "download saves", "save sync") {
+                Section {
+                    NavigationLink { LocalSaveCloudView() } label: {
+                        Label("Local game saves", systemImage: "icloud")
+                    }
+                } header: { Text("iCloud Drive") } footer: {
+                    Text("Manually upload or download a local game's configured save folder. Replacement requires confirmation and keeps a local backup.")
+                }
+            }
             if settingsShow("appearance", "liquid metal", "metal", "glass") {
                 Section {
                     Toggle("Liquid metal", isOn: $liquidMetal.on)
@@ -2624,8 +2874,14 @@ struct LibraryView: View {
             switch sheet {
             case .allSettings: AllSettingsView()
             case .steamSignIn: SteamSignInView()
+            case .epicSignIn: EpicSignInView()
             case .dock: MadeiraDockView(start: startDock)
+            case .controllerTest: NavigationStack { ControllerTestView() }
+            case .steamDownloadSource: NavigationStack { SteamDownloadSettingsView() }
             }
+        }
+        .onChange(of: model.runtimePreflightNotice) { _, notice in
+            if notice != nil { settingsSheet = nil }
         }
     }
     private var library: some View {
@@ -2667,6 +2923,7 @@ struct LibraryView: View {
                 // downloading) the games you added are the top section and the
                 // whole Steam section, sign-in included, follows them.
                 // Any other Group by choice lists every game in one set of groups.
+                LibraryDownloadsSection(open: { selected = $0 })
                 if group != "platform" {
                     LibraryGroupedGames(grouping: group, search: search, layout: layout, sort: sort, width: viewport.size.width,
                                         open: { selected = $0 }) { entry, list, dense in
@@ -2703,15 +2960,17 @@ struct LibraryView: View {
                 } else {
                     cells(entries, width: viewport.size.width)
                 }
+                EpicGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width, open: { selected = $0 })
                 }
             }
             // Ambient light behind the grid cards, in the content's own space so it scrolls with them.
             .backgroundPreferenceValue(AmbientGlowKey.self) { AmbientGlowLayer(items: $0) }
             .padding(16).frame(maxWidth: 1100).frame(maxWidth: .infinity)
         }
-        .refreshable { await SteamGamesSection.refresh() }
+        .modifier(LibraryScrollActivity())
+        .refreshable { await SteamGamesSection.refresh(); if EpicGamesSection.enabled { EpicLibraryModel.shared.refresh(force: true) } }
         .onReceive(controller.commands) { command in
-            guard tab == 0, selected == nil, !browser, !onboarding.presented else { return }
+            guard tab == 0, selected == nil, !browser, !externalBrowser, !onboarding.presented else { return }
             let items = focusOrder
             let ids = [LibraryEntry.desktopID] + items.map(\.id)
             let index = ids.firstIndex(where: { $0 == focused }) ?? 0
@@ -2730,6 +2989,12 @@ struct LibraryView: View {
                 model.save(entry); browser = false; selected = entry
             } }
         }
+        .sheet(isPresented: $externalBrowser) {
+            NavigationStack { ExternalGameLibraryView { entry in
+                model.save(entry)
+                if model.entries.contains(where: { $0.id == entry.id }) { externalBrowser = false; selected = entry }
+            } }
+        }
         .sheet(item: $selected) { entry in
             // The details page stays up until the session's starting screen takes
             // over (or an error needs the library's alert), instead of showing the
@@ -2744,6 +3009,7 @@ struct LibraryView: View {
             })
         }
         .onChange(of: model.current) { _, current in if current != nil { selected = nil } }
+        .onChange(of: model.runtimePreflightNotice) { _, notice in if notice != nil { selected = nil } }
         .onChange(of: model.error) { _, error in if error != nil { selected = nil } }
         .onChange(of: model.restartNotice) { _, notice in if notice != nil { selected = nil } }
         .onChange(of: model.jitNotice) { _, notice in if notice != nil { selected = nil } }
@@ -2941,6 +3207,20 @@ struct LibraryDetail: View {
                                 }.clipped()
                         )
                 }
+                if entry.desktop != true {
+                    Section("运行环境") {
+                        Button("检查运行环境", systemImage: "checkmark.shield") {
+                            guard !leaving else { return }
+                            leaving = true
+                            let profile = entry
+                            model.save(profile)
+                            dismiss()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                                model.runtimeCheckEntry = profile.id
+                            }
+                        }
+                    }
+                }
                 if entry.desktop != true { Section("Library details") {
                     TextField("Title", text: $entry.title)
                     Button("Find on Steam", systemImage: "magnifyingglass") { findCover = true }
@@ -3067,7 +3347,7 @@ struct LibraryDetail: View {
                     Text("Reduced-precision x87 can make older games faster at some cost in accuracy; it is off by default. Turn on AVX and AVX2 (off by default, 64-bit games) when a game built for AVX processors quits at start with an illegal instruction (c000001d); FEX then emulates AVX, which is slower. Report an NVIDIA GPU is for games that stop with \"no graphics card\" or \"failed to get GPU driver info\". With Fastsync, fast synchronization (on by default) handles events without a server round trip, and fast semaphore waits (off by default) does the same for semaphores. Settings apply to the next launch; a precision change may still require restarting Madeira.")
                 }
                 Section("On screen") {
-                    Toggle("Performance overlay", isOn: $entry.performance)
+                    NavigationLink("Performance information (all games)") { PerformanceOverlaySettingsPage() }
                     Toggle("Live logs", isOn: $entry.liveLogs)
                     Toggle("Touch controls", isOn: $entry.touchControls)
                     if GamepadInput.keyboardMouseAvailable {
@@ -3154,11 +3434,15 @@ struct LibraryDetail: View {
                     let name = entry.id.uuidString + ".jpg"; try jpeg.write(to: dir.appendingPathComponent(name), options: .atomic); entry.coverFile = name
                 } catch { self.error = error.localizedDescription }
             }
-            .confirmationDialog("Remove this library entry? Your executable and saves stay in drive_c.", isPresented: $remove, titleVisibility: .visible) {
+            .confirmationDialog("Remove this library entry? Your game files and saves stay in their folder.", isPresented: $remove, titleVisibility: .visible) {
                 Button("Remove", role: .destructive) { leaving = true; model.remove(entry.id); dismiss() }
             }
             .task {
-                if entry.graphicsAPI == nil, entry.desktop != true, let url = try? LibraryModel.executable(entry.relativePath) { entry.graphicsAPI = LibraryModel.graphicsImports(url) }
+                guard !GameSessionWork.shared.pausesBackgroundWork, entry.desktop != true else { return }
+                do {
+                    if entry.graphicsAPI == nil { entry.graphicsAPI = try LibraryModel.withExecutable(for: entry) { LibraryModel.graphicsImports($0) } }
+                    else if entry.externalLibraryID != nil { _ = try LibraryModel.withExecutable(for: entry) { $0 } }
+                } catch { if entry.externalLibraryID != nil { self.error = error.localizedDescription } }
             }
             .onDisappear { if !leaving { model.save(entry) } }
             .onReceive(LibraryController.shared.commands) { command in
@@ -3207,7 +3491,10 @@ struct SteamSearchView: View {
                 ForEach(results) { match in
                     Button { select(match); dismiss() } label: {
                         HStack {
-                            AsyncImage(url: URL(string: match.tiny_image ?? "")) { $0.resizable().scaledToFit() } placeholder: { Image(systemName: "gamecontroller") }.frame(width: 70, height: 40)
+                            CachedArtwork(url: URL(string: match.tiny_image ?? "")) { phase in
+                                if case .success(let image) = phase { image.resizable().scaledToFit() }
+                                else { Image(systemName: "gamecontroller") }
+                            }.frame(width: 70, height: 40)
                             Text(match.name).foregroundStyle(.primary)
                         }
                     }
@@ -3565,7 +3852,7 @@ struct MadeiraCredit: View {
 /// MADEIRA_RUNTIME_SETTINGS=0 hides this section.
 /// A sheet opened from Settings; LibraryView presents it from the Form itself.
 enum SettingsSheet: String, Identifiable {
-    case allSettings, steamSignIn, dock
+    case allSettings, steamSignIn, epicSignIn, dock, controllerTest, steamDownloadSource
     var id: String { rawValue }
 }
 
@@ -4058,10 +4345,11 @@ struct LibraryHUD: View {
                 Divider()
                 Toggle("Performance overlay", isOn: $model.performance)
                 if model.performance {
-                    ForEach(["FPS", "Frame time", "CPU", "GPU", "RAM", "Battery", "Thermal"], id: \.self) { field in
+                    ForEach(GlobalPerformanceOverlay.allowedFields, id: \.self) { field in
                         Toggle(field, isOn: Binding(get: { model.overlayFields.contains(field) }, set: { on in
-                            model.overlayFields.removeAll { $0 == field }; if on { model.overlayFields.append(field) }
+                            model.overlayFields = GlobalPerformanceOverlay.settingField(field, enabled: on, in: model.overlayFields)
                         })).font(.subheadline)
+                        .disabled(model.overlayFields.count == 1 && model.overlayFields.contains(field))
                     }
                 }
                 // The developer overlay's CAP and F pills (FPSOverlay), for library
@@ -4128,10 +4416,10 @@ struct LibraryLiveLogs: View {
 
 struct LibraryMetrics: View {
     @ObservedObject private var model = LibraryModel.shared
-    @State private var lastCount: UInt64 = 0
-    @State private var lastTime = Date()
-    @State private var fps = 0.0
-    @State private var memory = 0
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var sampler = PerformanceFrameSampler()
+    @State private var fps: Double?
+    @State private var memory: Int?
     @State private var battery = -1
     /// iOS lowers clocks from .serious on, so a frame rate that sags after a few
     /// minutes can be told apart from one the game or the runtime caused.
@@ -4148,22 +4436,29 @@ struct LibraryMetrics: View {
             .font(.caption.monospacedDigit().weight(.medium)).padding(.horizontal, 12).padding(.vertical, 8)
             .background(.black.opacity(0.8), in: Capsule()).foregroundStyle(.white)
             .onAppear {
-                lastCount = madeira_get_present_count(); lastTime = Date(); UIDevice.current.isBatteryMonitoringEnabled = true
-                applyGPUMeter()
+                resetSampling()
             }
             .onDisappear { UIDevice.current.isBatteryMonitoringEnabled = false; madeira_gpu_meter_enable(0) }
-            .onChange(of: model.overlayFields) { _, _ in applyGPUMeter() }
-            .onReceive(ticks) { now in
-                let count = madeira_get_present_count(); let dt = now.timeIntervalSince(lastTime)
-                let frames = count >= lastCount ? count - lastCount : 0
-                fps = Double(frames) / max(0.001, dt); lastCount = count; lastTime = now
+            .onChange(of: model.overlayFields) { _, _ in
+                UIDevice.current.isBatteryMonitoringEnabled = scenePhase == .active && model.overlayFields.contains("Battery")
+                applyGPUMeter()
+            }
+            .onChange(of: scenePhase) { _, _ in resetSampling() }
+            .onReceive(ticks) { _ in
+                guard scenePhase == .active else { return }
+                guard let sample = sampler.sample(count: madeira_get_present_count(), time: CACurrentMediaTime()) else {
+                    fps = nil
+                    return
+                }
+                let frames = sample.frames, dt = sample.elapsed
+                fps = sample.fps
                 var info = task_vm_info_data_t(); var size = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
                 let result = withUnsafeMutablePointer(to: &info) { $0.withMemoryRebound(to: integer_t.self, capacity: Int(size)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &size) } }
-                if result == KERN_SUCCESS { memory = Int(info.phys_footprint / 1048576) }
+                memory = result == KERN_SUCCESS ? Int(info.phys_footprint / 1048576) : nil
                 battery = UIDevice.current.batteryLevel < 0 ? -1 : Int(UIDevice.current.batteryLevel * 100)
                 let state = ProcessInfo.processInfo.thermalState
                 if state != thermal {
-                    LogStore.shared.log("[thermal] \(DeviceLoadDiagnostics.thermalName(thermal)) -> \(DeviceLoadDiagnostics.thermalName(state)) at \(String(format: "%.0f", fps)) FPS")
+                    LogStore.shared.log("[thermal] \(DeviceLoadDiagnostics.thermalName(thermal)) -> \(DeviceLoadDiagnostics.thermalName(state)) at \(String(format: "%.0f", sample.fps)) FPS")
                     thermal = state
                 }
                 if model.overlayFields.contains("CPU") { cpu = cpuMeter.sample() }
@@ -4176,15 +4471,25 @@ struct LibraryMetrics: View {
                 }
             }
     }
+    private func resetSampling() {
+        sampler.reset(count: madeira_get_present_count(), time: CACurrentMediaTime())
+        fps = nil
+        memory = nil
+        battery = -1
+        cpuMeter = CPUMeter()
+        cpu = nil
+        UIDevice.current.isBatteryMonitoringEnabled = scenePhase == .active && model.overlayFields.contains("Battery")
+        applyGPUMeter()
+    }
     /// ml1174: command buffers get a GPU-time handler only while GPU is shown.
     private func applyGPUMeter() {
-        madeira_gpu_meter_enable(model.overlayFields.contains("GPU") ? 1 : 0)
+        madeira_gpu_meter_enable(scenePhase == .active && model.overlayFields.contains("GPU") ? 1 : 0)
         lastGPUBusy = madeira_gpu_meter_busy_seconds(); lastGPUBuffers = madeira_gpu_meter_cmdbufs(); gpu = -1
     }
     private var parts: [String] {
         var result: [String] = []
-        if model.overlayFields.contains("FPS") { result.append(String(format: "%.0f FPS", fps)) }
-        if model.overlayFields.contains("Frame time") { result.append(fps > 0 ? String(format: "%.1f ms avg", 1000 / fps) : "— ms") }
+        if model.overlayFields.contains("FPS") { result.append(fps.map { String(format: "%.0f FPS", $0) } ?? "FPS —") }
+        if model.overlayFields.contains("Frame time") { result.append(fps.flatMap { $0 > 0 ? String(format: "%.1f ms avg", 1000 / $0) : nil } ?? "— ms") }
         if model.overlayFields.contains("CPU") {
             result.append(cpu.map { String(format: "CPU %.0f%% (top %.0f%%)", $0.total, $0.top) } ?? "CPU —")
         }
@@ -4193,15 +4498,15 @@ struct LibraryMetrics: View {
             else if gpuFrameMs > 0 { result.append(String(format: "GPU %.0f%% (%.1f ms)", gpu, gpuFrameMs)) }
             else { result.append(String(format: "GPU %.0f%%", gpu)) }
         }
-        if model.overlayFields.contains("RAM") { result.append("\(memory) MB") }
-        if model.overlayFields.contains("Battery"), battery >= 0 { result.append("\(battery)%") }
+        if model.overlayFields.contains("RAM") { result.append(memory.map { "\($0) MB" } ?? "RAM —") }
+        if model.overlayFields.contains("Battery") { result.append(battery >= 0 ? "\(battery)%" : "Battery —") }
         if model.overlayFields.contains("Thermal") {
             switch thermal {
             case .nominal: result.append("Cool")
             case .fair: result.append("Warm")
             case .serious: result.append("Hot")
             case .critical: result.append("Critical")
-            @unknown default: break
+            @unknown default: result.append("Thermal —")
             }
         }
         return result

@@ -174,6 +174,7 @@ final class LogStore: ObservableObject {
 
     /// Called from tail-file callback (background queue) or C callback.
     private func handleRawLine(_ raw: String) {
+        let raw = EpicLaunchLogPrivacy.shared.redact(raw)
         stateLock.lock(); let suppressed = displaySuppressed; stateLock.unlock()
         if suppressed { return }
         // Filter out lines we never want in UI (excessive byte spam, etc.)
@@ -327,6 +328,7 @@ final class LogStore: ObservableObject {
     /// land in the file alongside Wine/FEX output, picked up by the tail
     /// reader).
     private func appendToFile(_ message: String, level: LogEntry.Level = .info) {
+        let message = EpicLaunchLogPrivacy.shared.redact(message)
         let line = "[\(dateFormatter.string(from: Date()))] [\(level.rawValue)] \(message)\n"
         // Once Wine has pointed stderr at this same file (O_APPEND,
         // WineProcessBridge), write through it. Device logs kept not

@@ -116,6 +116,7 @@ extern kern_return_t vm_protect(mach_port_t target_task, vm_address_t address,
 #include "wine/rbtree.h"
 #include "unix_private.h"
 #include "ios_wow.h"
+#include "ios_native_lifetime.h"
 #include "wine/debug.h"
 
 /* ml648: the Mono-bridge alias table is defined further down, but the anon-alias
@@ -2954,6 +2955,38 @@ static void (*ios_jit_alias_pushback_cb)(unsigned long long, unsigned long long,
  * ml1205: a sub-floor window is pushed only through its owner's callback
  * (ios_push_subfloor_window). */
 static void *ios_jit_alias_pushback_peb = NULL;
+static pthread_mutex_t ios_jit_alias_callback_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void ios_jit_alias_consumer_done( void *token )
+{
+    ios_native_consumer_release( *(uint64_t *)token );
+}
+
+static void ios_jit_push_alias( unsigned long long guest, unsigned long long native,
+                                unsigned long long size, void *required_owner )
+{
+    void (*callback)(unsigned long long, unsigned long long, unsigned long long) = NULL;
+    uint64_t lease = 0;
+    sigset_t mask, previous;
+    sigemptyset( &mask );
+    sigaddset( &mask, SIGQUIT );
+    pthread_sigmask( SIG_BLOCK, &mask, &previous );
+    pthread_mutex_lock( &ios_jit_alias_callback_lock );
+    if (ios_jit_alias_pushback_cb &&
+        (!required_owner || required_owner == ios_jit_alias_pushback_peb))
+    {
+        lease = ios_native_consumer_acquire( ios_jit_alias_pushback_peb );
+        if (lease) callback = ios_jit_alias_pushback_cb;
+    }
+    pthread_mutex_unlock( &ios_jit_alias_callback_lock );
+    if (callback)
+    {
+        pthread_cleanup_push( ios_jit_alias_consumer_done, &lease );
+        callback( guest, native, size );
+        pthread_cleanup_pop( 1 );
+    }
+    pthread_sigmask( SIG_SETMASK, &previous, NULL );
+}
 
 void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
 {
@@ -3041,14 +3074,8 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
      * (via the unix_ios_push_jit_aliases unix-call), forward this new
      * mapping to it too. Early mappings (added before xtajit64 loads) are
      * picked up by the iteration in unix_ios_push_jit_aliases. */
-    {
-        /* Loaded once: a child's exit can clear it between a test and a call. */
-        void (*cb)(unsigned long long, unsigned long long, unsigned long long) =
-            __atomic_load_n(&ios_jit_alias_pushback_cb, __ATOMIC_ACQUIRE);
-        if (cb)
-            cb((unsigned long long)(uintptr_t)pe_base, (unsigned long long)(uintptr_t)jit_base,
-               (unsigned long long)size);
-    }
+    ios_jit_push_alias( (unsigned long long)(uintptr_t)pe_base,
+                        (unsigned long long)(uintptr_t)jit_base, (unsigned long long)size, NULL );
 }
 
 /* ml951: hand a sub-floor image window to FEX so QueryGuestExecutableRange can
@@ -3075,18 +3102,14 @@ void ios_push_subfloor_window( unsigned long long low_base, unsigned long long r
                  low_base );
         return;
     }
-    void (*cb)(unsigned long long, unsigned long long, unsigned long long) =
-        __atomic_load_n(&ios_jit_alias_pushback_cb, __ATOMIC_ACQUIRE);   /* loaded once, as above */
-    if (!cb) return;   /* pushed later by the catch-up loop */
     /* ml1205: another process's FEX. The owner's catch-up loop delivers it when
      * the owner's FEX starts later; a window the owner maps after another
      * process has replaced the callback is not pushed to the owner (one global
      * callback, a known gap). The owner is read after the callback: the register
      * path stores it before its release store of the callback. */
-    if (owner && owner != ios_jit_alias_pushback_peb) return;
     fprintf( stderr, "ml951: pushing sub-floor window guest %#llx+%#llx -> real %#llx to FEX (owner %p)\n",
              low_base, size, real_base, owner );
-    cb( low_base, real_base, size );
+    ios_jit_push_alias( low_base, real_base, size, owner );
 }
 
 /* unix_ios_push_jit_aliases handler. Called from PE-side ntdll's
@@ -3167,80 +3190,15 @@ static void *ios_pe_find_export( const unsigned char *base, const char *want )
     return NULL;
 }
 
-/* iOS-Madeira ml613: resolve BOTH FEX exports by walking the already-mapped
- * emulator module. Called at the END of unixcall_ios_push_jit_aliases — the
- * guaranteed initialization path — and RETRYABLE until it succeeds.
- *
- * ml612 hung the release-hook resolution off ios_resolve_fex_rip_lookup(), which
- * is only reached from a diagnostic path that did not run: ml612 shipped with
- * ios_fex_release_holds_cb permanently NULL, so its whole containment was inert
- * (verified — the run had zero [exact-rip] lines). Two rules come out of that:
- *
- *  1. Resolve on the path that ALWAYS runs, not on a probe's path.
- *  2. NEVER latch a failure. The old `static int tried` meant one early call
- *     before the module was mapped disabled resolution for the entire process
- *     lifetime. Now only success latches.
- *
- * Callbacks are published only after both lookups complete, and the resolved
- * flag is set LAST, so a concurrent reader either sees the old state or a fully
- * populated one — never a half-installed pair. */
+/* Retain the legacy diagnostic entry point, but do not discover raw PE exports.
+ * They were never callable from native Mach-O code (the ARM64EC exports begin
+ * with x64 thunks), and ios_fex_rip_resolved has intentionally remained zero.
+ * Scanning every process's PE headers also races the lifetime observer retiring
+ * a foreign generation: the calling thread pins only its own generation.
+ * Leave the diagnostic pointers NULL. The working thread-hold release path
+ * uses the separately registered owner callback in ios_hold_release_lookup. */
 void ios_resolve_fex_exports( void )
 {
-    int i;
-
-    /* ml614: latch on the POINTERS, not on ios_fex_rip_resolved — that flag is
-     * deliberately never set now (see below), so keying the early-out on it would
-     * re-parse the PE export table on every call, and one caller is a fault path. */
-    if (ios_fex_rip_from_hostpc_cb && ios_fex_release_holds_cb) return;  /* fully done */
-
-    for (i = 0; i < ios_jit_mapping_count; i++)
-    {
-        void *rip_cb, *rel_cb;
-        const char *nm = ios_pe_module_name( ios_jit_mappings[i].pe_base,
-                                             ios_jit_mappings[i].size );
-        if (!nm) continue;
-        if (!strstr( nm, "xtajit64" ) && !strstr( nm, "arm64ecfex" )) continue;
-
-        rip_cb = ios_pe_find_export( ios_jit_mappings[i].pe_base, "BTCpu64IosRipFromHostPC" );
-        rel_cb = ios_pe_find_export( ios_jit_mappings[i].pe_base, "BTCpu64IosReleaseThreadHolds" );
-
-        /* Record the addresses for diagnostics. */
-        if (rip_cb) ios_fex_rip_from_hostpc_cb = (void *)rip_cb;
-        if (rel_cb) ios_fex_release_holds_cb = (void *)rel_cb;
-        __sync_synchronize();
-
-        /* ⛔⛔ ml614: DO NOT ARM ios_fex_rip_resolved.
-         *
-         * These are ARM64EC **PE** exports. They are NOT callable from this
-         * (native Mach-O) code — their first bytes are the x64 entry thunk, which
-         * a native `blr` fetches as ARM64 instructions. ml613 armed them and
-         * crashed every single launch:
-         *
-         *   [xlate-exec] pc=0x71f99c4040 -> 0x125528040
-         *   [av-detail]  hostpc=0x125528040 hinsn=0x48c48b48   (x64 `48 8b c4 48`)
-         *   -> c0000005 in pthread_exit_wrapper, then c000001d
-         *
-         * ios_fex_rip_resolved gates the exact-RIP call in signal_arm64_ios.c.
-         * That path had NEVER executed before ml613 (the old resolver was reached
-         * only from a diagnostic entry point that never ran, and before that the
-         * pointer came from an out-of-bounds struct read), so arming it was a new
-         * live call, not a restoration.
-         *
-         * Re-arming requires EITHER a genuinely native ARM64 C-ABI bridge on FEX's
-         * host side, OR making the call from code already running inside the
-         * ARM64EC environment. Also PEB-key it first: this resolver latches the
-         * FIRST libarm64ecfex.dll mapping globally, and there are several
-         * pseudo-process instances in one Mach task. */
-        dprintf( 2, "[fex-exports] ml614 module=%s base=%p rip_from_hostpc=%p release_holds=%p "
-                    "(%s) -- RECORDED BUT NOT ARMED: EC PE exports are not callable "
-                    "from native code (ml613 regression)\n",
-                 nm, ios_jit_mappings[i].pe_base, rip_cb, rel_cb,
-                 (rip_cb && rel_cb) ? "both found"
-                                    : (rel_cb ? "release-only" : (rip_cb ? "rip-only" : "neither — will retry")) );
-        return;
-    }
-    dprintf( 2, "[fex-exports] ml613 emulator module not in ios_jit_mappings (%d entries) "
-                "-- will retry on the next alias push\n", ios_jit_mapping_count );
 }
 
 /* iOS-Madeira ml618: per-pseudo-process leaked-hold release callback.
@@ -3258,13 +3216,17 @@ void ios_resolve_fex_exports( void )
 static struct { void *peb; unsigned int (*cb)(void *, unsigned long long *, unsigned int *, unsigned int *); }
     ios_hold_release[IOS_HOLD_RELEASE_MAX];
 static int ios_hold_release_n;
+static pthread_mutex_t ios_hold_release_lock = PTHREAD_MUTEX_INITIALIZER;
 
 unsigned int (*ios_hold_release_lookup(void *peb))(void *, unsigned long long *, unsigned int *, unsigned int *)
 {
     int i;
+    unsigned int (*callback)(void *, unsigned long long *, unsigned int *, unsigned int *) = NULL;
+    pthread_mutex_lock( &ios_hold_release_lock );
     for (i = 0; i < ios_hold_release_n; i++)
-        if (ios_hold_release[i].peb == peb) return ios_hold_release[i].cb;
-    return NULL;
+        if (ios_hold_release[i].peb == peb) { callback = ios_hold_release[i].cb; break; }
+    pthread_mutex_unlock( &ios_hold_release_lock );
+    return callback;
 }
 
 struct ios_register_hold_release_args
@@ -3287,22 +3249,28 @@ NTSTATUS unixcall_ios_register_hold_release(void *args)
                 p ? p->peb : NULL, p ? p->callback : NULL);
         return STATUS_INVALID_PARAMETER;
     }
+    pthread_mutex_lock( &ios_hold_release_lock );
     for (i = 0; i < ios_hold_release_n; i++)
         if (ios_hold_release[i].peb == p->peb)
         {
             ios_hold_release[i].cb = p->callback;
+            pthread_mutex_unlock( &ios_hold_release_lock );
             dprintf(2, "[hold-release] ml618 re-registered peb=%p cb=%p slot=%d\n", p->peb, p->callback, i);
             return STATUS_SUCCESS;
         }
-    if (ios_hold_release_n >= IOS_HOLD_RELEASE_MAX)
+    for (i = 0; i < ios_hold_release_n; i++)
+        if (!ios_hold_release[i].peb) break;
+    if (i >= IOS_HOLD_RELEASE_MAX)
     {
+        pthread_mutex_unlock( &ios_hold_release_lock );
         dprintf(2, "[hold-release] ml618 TABLE FULL (%d) — peb=%p will leak holds\n",
                 ios_hold_release_n, p->peb);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    ios_hold_release[ios_hold_release_n].peb = p->peb;
-    ios_hold_release[ios_hold_release_n].cb  = p->callback;
-    ios_hold_release_n++;
+    ios_hold_release[i].peb = p->peb;
+    ios_hold_release[i].cb  = p->callback;
+    if (i == ios_hold_release_n) ios_hold_release_n++;
+    pthread_mutex_unlock( &ios_hold_release_lock );
     dprintf(2, "[hold-release] ml618 registered peb=%p cb=%p (%d live)\n",
             p->peb, p->callback, ios_hold_release_n);
     return STATUS_SUCCESS;
@@ -3362,8 +3330,10 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
     void *self = ios_jit_current_peb();
     int i, own_pushed = 0;
     if (!params || !params->callback) return STATUS_INVALID_PARAMETER;
+    pthread_mutex_lock( &ios_jit_alias_callback_lock );
     ios_jit_alias_pushback_peb = self;
-    __atomic_store_n(&ios_jit_alias_pushback_cb, params->callback, __ATOMIC_RELEASE);
+    ios_jit_alias_pushback_cb = params->callback;
+    pthread_mutex_unlock( &ios_jit_alias_callback_lock );
 
     /* ml951: any sub-floor window registered before xtajit64 loaded has not been
      * pushed yet — the per-registration push above needs this callback. Catch up,
@@ -3394,10 +3364,7 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
     if (own_pushed)
         dprintf(2, "[alias-push] peb=%p registered its emulator: %d image(s) mapped to this "
                 "process's own copy instead of the parent's\n", self, own_pushed);
-    /* ml613: the guaranteed init path — resolve both FEX exports here, where the
-     * emulator module is certainly mapped, instead of from a diagnostic probe
-     * (ml612's mistake) or from a dying thread inside pthread_exit (needlessly
-     * risky: parsing exports while the thread holds FEX locks). */
+    /* Legacy diagnostic hook; raw foreign PE export discovery is disabled. */
     ios_resolve_fex_exports();
     ERR("unixcall_ios_push_jit_aliases: registered callback + drained %d mappings\n",
         ios_jit_mapping_count);
@@ -3957,14 +3924,8 @@ void *ios_jit_translate_addr_for_owner(void *addr, void *owner_peb)
      * which cannot exist here. */
     if (any_live >= 0)
     {
-        static int xany_n;
-        if (xany_n < 20)
-        {
-            xany_n++;
-            dprintf(2, "[xlate-any] addr=%p owner=%p matched live entry pe=%p owner=%p (exact-owner miss) rev=ml454\n",
-                    addr, owner_peb, ios_jit_mappings[any_live].pe_base,
-                    ios_jit_mappings[any_live].owner_peb);
-        }
+        /* Also called directly on the guest stack and from signal handlers:
+         * keep this lookup free of libc locks, including diagnostic stdio. */
         return (void *)((uintptr_t)ios_jit_mappings[any_live].jit_base
                         + (a - (uintptr_t)ios_jit_mappings[any_live].pe_base));
     }
@@ -4470,10 +4431,14 @@ static int ios_img_off_is_exec( const void *img, size_t img_size, size_t off )
  * the importer's IAT directory is touched, and only slots whose target is a
  * non-executable section of an ARM64EC/ARM64 module. x64 targets keep PE
  * addresses: FEX runs their code at PE VAs, so their PE copy is the live one. */
+/* Defined with file_view below; callers hold virtual_mutex. */
+static int ios_unpooled_x64_image( const void *base, size_t size, void **image, size_t *image_size );
+
 static void ios_x64_iat_bind_live_data( char *base, size_t size )
 {
     static int said, calls;
     uintptr_t rs = (uintptr_t)base, re = rs + size, pe, lo, hi, page = 0;
+    size_t image_size;
     IMAGE_NT_HEADERS64 nt;
     IMAGE_DATA_DIRECTORY dir;
     unsigned int lfanew = 0;
@@ -4487,18 +4452,29 @@ static void ios_x64_iat_bind_live_data( char *base, size_t size )
         if (b && rs >= b && re <= b + ios_jit_mappings[i].size) { imp = i; break; }
     }
     /* ml1245: a pure x64 importer only; an EC module reads its pool-side IAT */
-    if (imp < 0 || ios_jit_mapping_machine( imp ) != 0x8664 || ios_jit_mapping_is_hybrid( imp )) return;
+    if (imp >= 0)
+    {
+        if (ios_jit_mapping_machine( imp ) != 0x8664 || ios_jit_mapping_is_hybrid( imp )) return;
+        pe = (uintptr_t)ios_jit_mappings[imp].pe_base;
+        image_size = ios_jit_mappings[imp].size;
+    }
+    else
+    {
+        void *image;
+        if (!ios_unpooled_x64_image( base, size, &image, &image_size )) return;
+        pe = (uintptr_t)image;
+    }
 
     /* The importer's headers are read fault-safe too, like its IAT pages below:
      * this runs on every protection change inside an x64 image, and a packer or
      * DRM stub may have made its own header page PAGE_NOACCESS. */
-    pe = (uintptr_t)ios_jit_mappings[imp].pe_base;
     if (!ios_safe_read( pe + offsetof( IMAGE_DOS_HEADER, e_lfanew ), &lfanew, sizeof(lfanew) )
-        || (size_t)lfanew + sizeof(nt) > ios_jit_mappings[imp].size
+        || (size_t)lfanew + sizeof(nt) > image_size
         || !ios_safe_read( pe + lfanew, &nt, sizeof(nt) )) return;
     if (nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
         nt.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IAT) return;
     dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+    if (dir.VirtualAddress > image_size || dir.Size > image_size - dir.VirtualAddress) return;
     lo = pe + dir.VirtualAddress > rs ? pe + dir.VirtualAddress : rs;
     hi = pe + dir.VirtualAddress + dir.Size < re ? pe + dir.VirtualAddress + dir.Size : re;
     if (!dir.Size || lo >= hi) return;
@@ -7436,13 +7412,14 @@ struct ios_wow_window
                                    inaccessible neighbour we verified and
                                    borrowed (see ios_wow_window_try). */
     pthread_t  owner;           /* thread that reserved it while peb == NULL */
+    uint64_t   native_generation; /* immutable even before the bootstrap has a PEB */
     /* per-process TEB block: a WoW process's TEB64/TEB32 pair must live in
      * its own window, so it cannot share the session-wide teb_block. */
     void      *teb_block;
     void     **next_free_teb;   /* same type as the session-wide next_free_teb */
     int        teb_block_pos;
-    unsigned   wine_mono;       /* ml1279: libmono-2.0-x86.dll was mapped in this window, so its
-                                   RWX memory is plain read/write from then on */
+    unsigned   wine_mono;       /* Wine Mono was mapped in this window; diagnostic only,
+                                   suppresses repeated runtime-mapping notices */
 };
 static struct ios_wow_window ios_wow_windows[IOS_WOW_MAX_WINDOWS];
 static unsigned ios_wow_window_count;
@@ -8736,6 +8713,7 @@ NTSTATUS ios_wow_window_reserve(void)
     }
     slot->peb           = NULL;
     slot->owner         = pthread_self();
+    slot->native_generation = ios_native_current_generation();
     slot->teb_block     = NULL;
     slot->next_free_teb = NULL;
     slot->teb_block_pos = 0;
@@ -8866,6 +8844,19 @@ void ios_wow_window_release( void *peb_id )
     pthread_mutex_unlock( &ios_wow_mutex );
     if (slot) ios_wow_window_mark_released( slot );
 }
+
+static void ios_wow_window_finish_generation( uint64_t generation )
+{
+    unsigned i;
+    for (i = 0; i < ios_wow_window_count; i++)
+    {
+        struct ios_wow_window *slot = &ios_wow_windows[i];
+        pthread_mutex_lock( &ios_wow_mutex );
+        int match = slot->native_generation == generation && slot->base && !slot->dead;
+        pthread_mutex_unlock( &ios_wow_mutex );
+        if (match) ios_wow_window_mark_released( slot );
+    }
+}
 /* ==== end of WoW64 guest windows ==== */
 #else
 int ios_main_image_i386 = 0;
@@ -8881,6 +8872,7 @@ void ios_wow_window_bind( void *peb_id ) { }
 void ios_wow_window_release( void *peb_id ) { }
 void ios_wow_window_release_current(void) { }
 void ios_wow_window_retire_current(void) { }
+static void ios_wow_window_finish_generation( uint64_t generation ) { (void)generation; }
 #endif  /* WINE_IOS */
 
 
@@ -9942,15 +9934,14 @@ int ios_jit_mark_ec_range( const void *addr, size_t size )
  * would make arm64x_check_call BL into x86-64 bytes as if ARM64). */
 static void clear_arm64ec_range( const void *addr, size_t size );
 
-/* Task #25: release everything a dead pseudo-process allocated from the
- * pool head. Called from process_exit_wrapper on the dying process's own
- * thread — its ranges become reusable after IOS_POOL_REUSE_GRACE_SEC (see
- * the ledger comment for why laggard exit threads make immediate reuse
- * unsafe). Mapping entries covering freed ranges are tombstoned
+/* Release a native-quiescent process generation's pool allocations. Only the
+ * lifetime observer may call this after native endpoint death and consumer
+ * drainage. The allocator's existing reuse grace is an extra quarantine, not
+ * the completion test. Mapping entries covering freed ranges are tombstoned
  * (size=0 → matches nothing; pe_base=NULL → slot reusable); anon RWX
  * aliases (FEX CodeBuffers) in freed ranges are cleared; EC bitmap bits
  * are cleared so a reused range starts with a clean call-routing slate. */
-void ios_jit_reclaim_process( void *peb )
+static void ios_jit_reclaim_quiescent( void *peb )
 {
     size_t total = 0;
     int ranges = 0, maps_killed = 0, aliases_killed = 0;
@@ -9964,6 +9955,7 @@ void ios_jit_reclaim_process( void *peb )
      * dying, its emulator's pool copy is reclaimed below and the next image
      * map anywhere would call freed (later reused) code. Drop the callback:
      * the next emulator to register gets the whole table from its drain. */
+    pthread_mutex_lock( &ios_jit_alias_callback_lock );
     if (peb == ios_jit_alias_pushback_peb && ios_jit_alias_pushback_cb)
     {
         dprintf(2, "[alias-push] peb=%p exits while its emulator receives the alias pushes: "
@@ -9971,6 +9963,16 @@ void ios_jit_reclaim_process( void *peb )
         __atomic_store_n(&ios_jit_alias_pushback_cb, NULL, __ATOMIC_RELEASE);
         ios_jit_alias_pushback_peb = NULL;
     }
+    pthread_mutex_unlock( &ios_jit_alias_callback_lock );
+
+    pthread_mutex_lock( &ios_hold_release_lock );
+    for (i = 0; i < ios_hold_release_n; i++)
+        if (ios_hold_release[i].peb == peb)
+        {
+            ios_hold_release[i].cb = NULL;
+            ios_hold_release[i].peb = NULL;
+        }
+    pthread_mutex_unlock( &ios_hold_release_lock );
 
     pthread_mutex_lock( &ios_pool_lock );
 
@@ -11351,13 +11353,8 @@ static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned gua
              "wrong. Nothing should ever place a view across a guest window.\n",
              (void *)base, straddlers );
 
-    /* 4. JIT-pool records: the dead process's pool ranges and copies, then
-     *    anything at all that describes memory inside the window. */
-    if (dead_peb)
-    {
-        extern void ios_jit_reclaim_process( void *peb );
-        ios_jit_reclaim_process( dead_peb );
-    }
+    /* The lifetime observer reclaimed this generation before releasing its
+     * window. A new process must never repeat a PEB-keyed retirement request. */
     ios_jit_purge_window( base, IOS_WOW_WINDOW_SIZE );
 
     /* 5. registries keyed by the dead PEB: the next child's PEB is allocated
@@ -11891,13 +11888,80 @@ static int ios_guest_image_write_enabled(void)
     return cached;
 }
 
+/* Pure x64 SEC_IMAGE bytes are decoded by FEX at PE VAs. Native ARM64 and
+ * CHPE/ARM64EC images still require their executable pool copy.  This only
+ * changes host protection: Wine's VPROT_EXEC and FEX SMC notifications remain.
+ * MADEIRA_X64_IMAGE_HOST_DATA=0 restores pool copies for an A/B run. */
+static int ios_x64_image_host_data_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *s = getenv( "MADEIRA_X64_IMAGE_HOST_DATA" );
+        cached = !(s && (*s == '0' || *s == 'n' || *s == 'N'));
+    }
+    return cached;
+}
+
+static int ios_unpooled_x64_image( const void *base, size_t size, void **image, size_t *image_size )
+{
+    struct file_view *view;
+    IMAGE_NT_HEADERS64 nt;
+    IMAGE_DATA_DIRECTORY dir;
+    unsigned short mz;
+    unsigned int lfanew, cfg_size;
+    ULONGLONG chpe;
+    uintptr_t b, off;
+    size_t span, protect_span, field = offsetof( IMAGE_LOAD_CONFIG_DIRECTORY64, CHPEMetadataPointer );
+
+    if (!ios_x64_image_host_data_enabled() || !size || !(view = find_view( base, 1 ))) return 0;
+    if (!(view->protect & SEC_IMAGE) || (view->protect & (VPROT_ARM64EC | VPROT_SYSTEM))) return 0;
+    b = (uintptr_t)view->base;
+    if (view->size < 0x40 || !ios_safe_read( b, &mz, sizeof(mz) ) || mz != IMAGE_DOS_SIGNATURE ||
+        !ios_safe_read( b + 0x3c, &lfanew, sizeof(lfanew) ) ||
+        lfanew > view->size || sizeof(nt) > view->size - lfanew ||
+        !ios_safe_read( b + lfanew, &nt, sizeof(nt) )) return 0;
+    if (nt.Signature != IMAGE_NT_SIGNATURE || nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt.FileHeader.SizeOfOptionalHeader < sizeof(nt.OptionalHeader) ||
+        nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return 0;
+    span = nt.OptionalHeader.SizeOfImage;
+    off = (uintptr_t)base - b;
+    /* Views use 4KB PE sizes, while mprotect_range covers 16KB host pages.
+     * create_view requires a host-aligned base, so trailing host-page padding
+     * cannot contain a different view. Never cross that rounded image end. */
+    protect_span = (span + host_page_mask) & ~host_page_mask;
+    if (!span || span > view->size || lfanew > span || sizeof(nt) > span - lfanew ||
+        off >= span || size > protect_span - off ||
+        nt.OptionalHeader.NumberOfRvaAndSizes > 16) return 0;
+    if (nt.OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG)
+    {
+        dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+        if (dir.VirtualAddress || dir.Size)
+        {
+            if (!dir.VirtualAddress || dir.Size < sizeof(cfg_size) ||
+                dir.VirtualAddress > span || dir.Size > span - dir.VirtualAddress ||
+                !ios_safe_read( b + dir.VirtualAddress, &cfg_size, sizeof(cfg_size) )) return 0;
+            cfg_size = min( cfg_size, dir.Size );
+            if (cfg_size < sizeof(cfg_size)) return 0;
+            if (cfg_size > field)
+            {
+                if (cfg_size - field < sizeof(chpe) ||
+                    !ios_safe_read( b + dir.VirtualAddress + field, &chpe, sizeof(chpe) ) || chpe) return 0;
+            }
+        }
+    }
+    if (image) *image = view->base;
+    if (image_size) *image_size = span;
+    return 1;
+}
+
 static int ios_guest_image_is_host_data( const void *base, size_t size )
 {
 #ifdef WINE_IOS
     struct file_view *view;
 
+    if (!ios_wow_in_window( base )) return ios_unpooled_x64_image( base, size, NULL, NULL );
     if (!ios_guest_image_write_enabled()) return 0;
-    if (!ios_wow_in_window( base )) return 0;
     if (!(view = find_view( base, size ))) return 0;
     return (view->protect & SEC_IMAGE) != 0;
 #else
@@ -11975,22 +12039,21 @@ static int ios_guest_anon_rwx_view_ok( const struct file_view *view )
  * Same exclusions as below (EC_CODE requests, the pool, existing aliases, images, file
  * mappings), but no size heuristic and no ARM64EC view requirement.
  *
- * ml1282: automatic per window. It turns on in a window when Wine Mono's runtime
- * (libmono-2.0-x86.dll, loaded by mscoree) is mapped there -- verified on Terraria; a
- * Unity game loads its own mono-2.0-bdwgc.dll and is not matched. MADEIRA_WOW_RWX_PLAIN=0
- * never turns it on, =1 turns it on for every 32-bit window. */
+ * Enabled by default for live 32-bit guest windows, independent of the managed
+ * runtime's filename. Guest-owned Mono runtimes need the same host-data treatment
+ * as Wine Mono. MADEIRA_WOW_RWX_PLAIN=0 disables this WoW rule (the existing
+ * guest-data heuristic remains), =1 explicitly
+ * selects the default. Dead, leaked and unknown windows do not qualify. */
 static int ios_wow_rwx_plain_mode(void)
 {
-    static int cached = -2;
-    if (cached == -2)
+    static int cached = -1;
+    if (cached < 0)
     {
         const char *s = getenv( "MADEIRA_WOW_RWX_PLAIN" );
-        cached = !s || !*s ? -1 : (*s == '1') ? 1 : 0;
+        cached = !s || !*s || *s == '1';
         dprintf( 2, "[wow-rwx] ml1279 MADEIRA_WOW_RWX_PLAIN=%s -> 32-bit guest RWX memory is %s\n",
                  s ? s : "(unset)",
-                 cached == 1 ? "plain read/write in every 32-bit window" :
-                 cached == 0 ? "pool-aliased (stores emulated)" :
-                               "plain read/write in a window once Wine Mono is mapped there" );
+                 cached ? "plain read/write in live 32-bit windows" : "pool-aliased (stores emulated)" );
     }
     return cached;
 }
@@ -11999,13 +12062,8 @@ static int ios_wow_rwx_plain_mode(void)
  * other window lookups on this path. */
 static struct ios_wow_window *ios_wow_rwx_plain_window( const void *addr )
 {
-    int mode = ios_wow_rwx_plain_mode();
-    struct ios_wow_window *w;
-
-    if (!mode) return NULL;
-    if (!(w = ios_wow_live_slot_for_addr( addr ))) return NULL;
-    if (mode == 1 || __atomic_load_n( &w->wine_mono, __ATOMIC_ACQUIRE )) return w;
-    return NULL;
+    if (!ios_wow_rwx_plain_mode()) return NULL;
+    return ios_wow_live_slot_for_addr( addr );
 }
 
 /* Called for every image mapping: notice Wine Mono's 32-bit runtime. */
@@ -12032,7 +12090,7 @@ static void ios_wow_note_image( const void *base, const UNICODE_STRING *nt_name 
     if (__atomic_exchange_n( &w->wine_mono, 1, __ATOMIC_ACQ_REL )) return;
     dprintf( 2, "[wow-rwx] ml1282 Wine Mono mapped at %p in window B=%p: its RWX memory is %s\n",
              base, (void *)w->base,
-             ios_wow_rwx_plain_mode() ? "plain read/write from now on"
+             ios_wow_rwx_plain_mode() ? "plain read/write"
                                       : "still pool-aliased (MADEIRA_WOW_RWX_PLAIN=0)" );
 }
 
@@ -12044,48 +12102,115 @@ static int ios_wow_rwx_view_ok( const struct file_view *view )
 }
 
 /* The range is host-page rounded (16 KB) and can run past the end of a guest
- * allocation (0x41000 -> 0x44000), so every view it touches must qualify. */
+ * allocation (0x41000 -> 0x44000). Only the final host-page padding of a
+ * qualifying view may lack Wine view bookkeeping; other holes are rejected. */
 static int ios_guest_anon_rwx_is_host_data( const void *base, size_t size )
 {
 #ifdef WINE_IOS
-    extern int ios_jit_anon_alias_find_cover(void *, size_t, void **, void **);
+    extern int ios_jit_anon_alias_overlaps(void *, size_t, uintptr_t *, uintptr_t *);
     extern void *ios_jit_rx_base_global;
     extern size_t ios_jit_pool_size_global;
-    void *cov_rw = NULL, *cov_rx = NULL;
     uintptr_t b = (uintptr_t)base, e = b + size, a, rx = (uintptr_t)ios_jit_rx_base_global;
-    int any = 0;
+    struct ios_wow_window *plain_w;
 
-    struct ios_wow_window *plain_w = (!ios_alloc_ec_code && e > b) ? ios_wow_rwx_plain_window( base ) : NULL;
-
-    if (plain_w && e - 1 < plain_w->base + IOS_WOW_WINDOW_SIZE &&
-        !(rx && e > rx && b < rx + ios_jit_pool_size_global) &&
-        !ios_jit_anon_alias_find_cover( (void *)base, size, &cov_rw, &cov_rx ))
+    if (ios_alloc_ec_code || e <= b) return 0;
+    if (rx && ios_jit_pool_size_global)
     {
-        for (a = b; a < e; )
-        {
-            struct file_view *view = find_view( (const void *)a, 1 );
-            if (!view) { a = (a + 0x1000) & ~(uintptr_t)0xfff; continue; }   /* rounding gap */
-            if (!ios_wow_rwx_view_ok( view )) { any = -1; break; }
-            any = 1;
-            a = (uintptr_t)view->base + view->size;
-        }
-        if (any == 1) return 1;
-        any = 0;
+        if (ios_jit_pool_size_global > UINTPTR_MAX - rx) return 0;
+        if (e > rx && b < rx + ios_jit_pool_size_global) return 0;
     }
-
-    if (!ios_guest_rwx_data_enabled() || ios_alloc_ec_code || !arm64ec_view) return 0;
-    if (e <= b) return 0;
-    if (rx && e > rx && b < rx + ios_jit_pool_size_global) return 0;
-    if (ios_jit_anon_alias_find_cover( (void *)base, size, &cov_rw, &cov_rx )) return 0;
+    if (ios_jit_anon_alias_overlaps( (void *)base, size, NULL, NULL )) return 0;
+    plain_w = ios_wow_rwx_plain_window( base );
+    if (plain_w)
+    {
+        if (plain_w->base > UINTPTR_MAX - IOS_WOW_WINDOW_SIZE || b < plain_w->base ||
+            e > plain_w->base + IOS_WOW_WINDOW_SIZE) return 0;
+    }
+    else if (!ios_guest_rwx_data_enabled() || !arm64ec_view) return 0;
     for (a = b; a < e; )
     {
         struct file_view *view = find_view( (const void *)a, 1 );
-        if (!view) { a = (a + 0x1000) & ~(uintptr_t)0xfff; continue; }   /* rounding gap */
-        if (!ios_guest_anon_rwx_view_ok( view )) return 0;
-        any = 1;
-        a = (uintptr_t)view->base + view->size;
+        uintptr_t vbase, vend, rounded;
+        if (!view || !(plain_w ? ios_wow_rwx_view_ok( view ) : ios_guest_anon_rwx_view_ok( view ))) return 0;
+        vbase = (uintptr_t)view->base;
+        if (!view->size || vbase > a || view->size > UINTPTR_MAX - vbase) return 0;
+        vend = vbase + view->size;
+        if (vend <= a || vend > UINTPTR_MAX - host_page_mask) return 0;
+        rounded = (vend + host_page_mask) & ~host_page_mask;
+        if (e <= rounded) return 1;
+        a = rounded;
     }
-    return any;
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+
+/* iOS-Madeira ml1400: executable anonymous section views may contain guest data.
+ *
+ * CoreCLR's Windows double mapper reserves one anonymous section, first maps
+ * EXECUTE|READ|WRITE, commits RX pages, and creates RW views of the same offsets.
+ * The hypothesis is that giving one of these views a private JIT-pool remap
+ * breaks sharing and contributes to the observed write-barrier copy assertion.
+ * Zero-filled PRE-REMAP logs alone do not prove that relationship; the exact
+ * SEC_RESERVE dual-view fixture and a matched device run must test it.
+ *
+ * This rule removes only host EXEC for qualifying anonymous section views.
+ * Wine's VPROT_EXEC and FEX SMC bookkeeping remain. Native EC requests/views,
+ * pool ranges, any existing alias overlap, images, files and system views keep
+ * their existing path. MADEIRA_GUEST_SECTION_EXEC_DATA=0 restores that path.
+ */
+static int ios_guest_section_exec_data_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *s = getenv( "MADEIRA_GUEST_SECTION_EXEC_DATA" );
+        cached = !(s && (*s == '0' || *s == 'n' || *s == 'N'));
+    }
+    return cached;
+}
+
+static int ios_guest_section_exec_view_ok( const struct file_view *view )
+{
+    if (is_view_valloc( view )) return 0;   /* only a view of an anonymous section */
+    if (view->protect & (SEC_IMAGE | SEC_FILE | VPROT_ARM64EC | VPROT_SYSTEM)) return 0;
+    return 1;
+}
+
+static int ios_guest_exec_section_is_host_data( const void *base, size_t size )
+{
+#ifdef WINE_IOS
+    extern int ios_jit_anon_alias_overlaps(void *, size_t, uintptr_t *, uintptr_t *);
+    extern void *ios_jit_rx_base_global;
+    extern size_t ios_jit_pool_size_global;
+    uintptr_t b = (uintptr_t)base, e = b + size, a, rx = (uintptr_t)ios_jit_rx_base_global;
+
+    if (!ios_guest_section_exec_data_enabled() || ios_alloc_ec_code || !arm64ec_view) return 0;
+    if (e <= b) return 0;
+    if (rx && ios_jit_pool_size_global)
+    {
+        if (ios_jit_pool_size_global > UINTPTR_MAX - rx) return 0;
+        if (e > rx && b < rx + ios_jit_pool_size_global) return 0;
+    }
+    if (ios_jit_anon_alias_overlaps( (void *)base, size, NULL, NULL )) return 0;
+    for (a = b; a < e; )
+    {
+        struct file_view *view = find_view( (const void *)a, 1 );
+        uintptr_t vbase, vend, rounded;
+        if (!view || !ios_guest_section_exec_view_ok( view )) return 0;
+        vbase = (uintptr_t)view->base;
+        if (!view->size || vbase > a || view->size > UINTPTR_MAX - vbase) return 0;
+        vend = vbase + view->size;
+        if (vend <= a || vend > UINTPTR_MAX - host_page_mask) return 0;
+        rounded = (vend + host_page_mask) & ~host_page_mask;
+        /* create_view requires host-aligned bases. Only the final host-page
+         * padding of this qualifying view may lack Wine view bookkeeping. */
+        if (e <= rounded) return 1;
+        a = rounded;
+    }
+    return 0;
 #else
     return 0;
 #endif
@@ -12134,7 +12259,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
     {
         static unsigned long gid_n;
         if (++gid_n <= 24 && !ios_in_mach_exc)
-            dprintf( 2, "[guest-image] ml1030 #%lu %p+0x%lx prot=%c%c%c — 32-bit image page, "
+            dprintf( 2, "[guest-image] ml1030 #%lu %p+0x%lx prot=%c%c%c — guest image page, "
                         "EXEC has no host meaning here; applying %c%c- instead\n",
                      gid_n, base, (unsigned long)size,
                      (unix_prot & PROT_READ)  ? 'r' : '-',
@@ -12152,6 +12277,21 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
             dprintf( 2, "[guest-rwx] #%lu %p+0x%lx prot=%c%c%c — anonymous guest memory, "
                         "EXEC is FEX bookkeeping; applying %c%c- instead\n",
                      grd_n, base, (unsigned long)size,
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-',
+                     (unix_prot & PROT_EXEC)  ? 'x' : '-',
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-' );
+        unix_prot &= ~PROT_EXEC;
+        if (!unix_prot) unix_prot = PROT_READ;
+    }
+    else if ((unix_prot & PROT_EXEC) && ios_guest_exec_section_is_host_data( base, size ))
+    {
+        static unsigned long gsx_n;
+        if (++gsx_n <= 24 && !ios_in_mach_exc)
+            dprintf( 2, "[guest-sec] ml1400 #%lu %p+0x%lx prot=%c%c%c — executable view of an anonymous section, "
+                        "EXEC is FEX bookkeeping; applying %c%c- instead (keeping section backing)\n",
+                     gsx_n, base, (unsigned long)size,
                      (unix_prot & PROT_READ)  ? 'r' : '-',
                      (unix_prot & PROT_WRITE) ? 'w' : '-',
                      (unix_prot & PROT_EXEC)  ? 'x' : '-',
@@ -12787,6 +12927,21 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                  * FEX executes via user_VA → R+X works. */
                 size_t page_size = 0x4000;
                 size_t alloc_size = (size + page_size - 1) & ~(page_size - 1);
+
+                /* ml1400: record section views entering the private pool-remap path.
+                 * A separate dual-view probe must establish sharing loss. */
+                {
+                    struct file_view *sv = find_view( base, 1 );
+                    static int secpool_n;
+                    if (sv && !is_view_valloc( sv ) && secpool_n < 16)
+                        dprintf( 2, "[sec-pool] ml1400 #%d %p+0x%lx view=%p+0x%lx protect=%#x prot=%c%c%c — "
+                                    "section view enters private pool-remap path (sharing effect unverified)\n",
+                                 ++secpool_n, base, (unsigned long)size, sv->base, (unsigned long)sv->size,
+                                 (unsigned)sv->protect,
+                                 (unix_prot & PROT_READ)  ? 'r' : '-',
+                                 (unix_prot & PROT_WRITE) ? 'w' : '-',
+                                 (unix_prot & PROT_EXEC)  ? 'x' : '-' );
+                }
 
                 /* iOS-Madeira ml625: NEVER RE-BACK A GUEST VA THAT IS ALREADY LIVE.
                  *
@@ -14172,6 +14327,210 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
 }
 
 
+/* vm-alloc trace begin */
+/* virtual_mutex serializes these counters. Default is entirely no-touch.
+ * Saved guest context/stack reads are bounded, fault-safe snapshots only;
+ * stack qwords are raw candidates, never an unwound callstack. */
+static int ios_vm_alloc_trace_read( uintptr_t address, void *out, size_t size )
+{
+    mach_vm_size_t got = 0;
+    if (address < 0x10000 || address > UINTPTR_MAX - size) return 0;
+    return mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)address, size,
+                                  (mach_vm_address_t)(uintptr_t)out, &got ) == KERN_SUCCESS && got == size;
+}
+
+/* Current native FP chain only; translated LRs may identify PE callers.
+ * Corrupt/missing frame records terminate the walk without raw dereferences. */
+static void ios_vm_alloc_trace_native( unsigned int kind, unsigned long seq, uintptr_t fp, const char *origin )
+{
+    uintptr_t initial = fp;
+    uint64_t frame[2], module, pe;
+    int i;
+    for (i = 0; i < 16; i++)
+    {
+        if (fp < 0x10000 || (fp & 15) || fp < initial || fp - initial > 0x100000 ||
+            !ios_vm_alloc_trace_read( fp, frame, sizeof(frame) )) break;
+        module = 0;
+        pe = ios_jit_reverse_translate( frame[1], &module );
+        dprintf( 2, "[vm-alloc-native] origin=%s kind=%s seq=%lu frame=%d fp=0x%llx raw_lr=0x%llx "
+                 "pe=0x%llx module=0x%llx offset=0x%llx\n", origin, kind ? "decommit" : "commit",
+                 seq, i, (unsigned long long)fp, (unsigned long long)frame[1],
+                 (unsigned long long)pe, (unsigned long long)module,
+                 (unsigned long long)(module && pe >= module ? pe - module : 0) );
+        if (frame[0] <= fp) break;
+        fp = (uintptr_t)frame[0];
+    }
+}
+
+/* Active ARM64 syscall_frame, unlike the saved WOW64 context above.
+ * unix_private.h fixes the TEB pointer at 0x378; signal_arm64_ios.c fixes
+ * fp/lr/sp/pc at frame+0xe8. Read both indirections fault-safely. */
+static void ios_vm_alloc_trace_syscall( unsigned int kind, unsigned long seq, TEB *teb )
+{
+    uintptr_t address = 0;
+    uint64_t state[4] = {0}, pc_module = 0, lr_module = 0, pc_pe = 0, lr_pe = 0;
+    int ok = teb && ios_vm_alloc_trace_read( (uintptr_t)teb + 0x378, &address, sizeof(address) ) &&
+             address >= 0x10000 && address <= UINTPTR_MAX - 0x108 &&
+             ios_vm_alloc_trace_read( address + 0xe8, state, sizeof(state) );
+    if (ok)
+    {
+        pc_pe = ios_jit_reverse_translate( state[3], &pc_module );
+        lr_pe = ios_jit_reverse_translate( state[1], &lr_module );
+    }
+    dprintf( 2, "[vm-alloc-syscall] kind=%s seq=%lu read=%d fp=0x%llx sp=0x%llx pc=0x%llx lr=0x%llx "
+             "pc_pe=0x%llx pc_module=0x%llx pc_offset=0x%llx "
+             "lr_pe=0x%llx lr_module=0x%llx lr_offset=0x%llx\n", kind ? "decommit" : "commit", seq, ok,
+             (unsigned long long)(ok ? state[0] : 0), (unsigned long long)(ok ? state[2] : 0),
+             (unsigned long long)(ok ? state[3] : 0), (unsigned long long)(ok ? state[1] : 0),
+             (unsigned long long)pc_pe, (unsigned long long)pc_module,
+             (unsigned long long)(pc_module && pc_pe >= pc_module ? pc_pe - pc_module : 0),
+             (unsigned long long)lr_pe, (unsigned long long)lr_module,
+             (unsigned long long)(lr_module && lr_pe >= lr_module ? lr_pe - lr_module : 0) );
+    if (ok) ios_vm_alloc_trace_native( kind, seq, (uintptr_t)state[0], "syscall" );
+}
+
+static void ios_vm_alloc_trace( unsigned int kind, const void *base, SIZE_T size,
+                                ULONG type, ULONG protect, const struct file_view *view,
+                                int any_committed, int was_committed, NTSTATUS status )
+{
+    static int enabled = -1;
+    static unsigned long sequence[2];
+    unsigned long seq;
+    uintptr_t ca;
+    uint64_t rip, rsp, stack[16];
+    TEB *teb;
+    int saved, stack_ok, i, saved_errno;
+    if (enabled < 0)
+    {
+        const char *value = getenv( "MADEIRA_VM_ALLOC_TRACE" );
+        enabled = value && !strcmp( value, "1" );
+    }
+    if (!enabled || kind > 1) return;
+    /* Only the guest traffic under investigation owns these sample budgets. */
+    if (ios_is_arena_addr( base ) ||
+        (!kind && (size != 0x4000 || any_committed || was_committed)) ||
+        (kind && size != 0x100000)) return;
+    seq = ++sequence[kind];
+    if (seq > 4 && seq % 4096) return;
+    saved_errno = errno;
+    ca = 0; rip = 0; rsp = 0; saved = 0; stack_ok = 0;
+    teb = NtCurrentTeb();
+    if (teb && ios_vm_alloc_trace_read( (uintptr_t)teb + 0x1788, &ca, sizeof(ca) ) &&
+        ca >= 0x10000 && ca <= UINTPTR_MAX - 0x148)
+    {
+        saved = ios_vm_alloc_trace_read( ca + 0x50 + 0xf8, &rip, sizeof(rip) ) &&
+                ios_vm_alloc_trace_read( ca + 0x50 + 0x98, &rsp, sizeof(rsp) );
+        if (saved && !(rsp & 7))
+            stack_ok = ios_vm_alloc_trace_read( (uintptr_t)rsp, stack, sizeof(stack) );
+    }
+    dprintf( 2, "[vm-alloc-trace] kind=%s seq=%lu tid=%lu base=%p size=0x%lx type=0x%x "
+             "protect=0x%x view=%p view_size=0x%lx any_committed=%d was_committed=%d "
+             "status=0x%x context=saved-context-not-current saved=%d rip=0x%llx rsp=0x%llx stack=raw-candidates-not-callstack stack_read=%d\n",
+             kind ? "decommit" : "commit", seq,
+             teb ? (unsigned long)(ULONG_PTR)teb->ClientId.UniqueThread : 0,
+             base, (unsigned long)size, type, protect, view ? view->base : NULL,
+             view ? (unsigned long)view->size : 0, any_committed, was_committed, status,
+             saved, (unsigned long long)(saved ? rip : 0), (unsigned long long)(saved ? rsp : 0), stack_ok );
+    if (stack_ok)
+    {
+        dprintf( 2, "[vm-alloc-stack] kind=%s seq=%lu raw_candidates=", kind ? "decommit" : "commit", seq );
+        for (i = 0; i < 16; i++) dprintf( 2, "%s0x%llx", i ? "," : "", (unsigned long long)stack[i] );
+        dprintf( 2, "\n" );
+    }
+    ios_vm_alloc_trace_native( kind, seq, (uintptr_t)__builtin_frame_address(0), "host" );
+    ios_vm_alloc_trace_syscall( kind, seq, teb );
+    errno = saved_errno;
+}
+/* vm-alloc trace end */
+
+/* zero-read probe core begin */
+/* These probes run under virtual_mutex. Parse once without allocation or
+ * config-file IO; only exact env.MADEIRA_VM_ZERO_SAMPLE=1 opts into fewer
+ * actual reads. Full reads remain the default. Each operation/band owns its
+ * budget so busy commit/arena traffic cannot starve decommit/guest samples. */
+enum ios_zero_probe_kind { IOS_ZERO_COMMIT, IOS_ZERO_DECOMMIT };
+enum ios_zero_probe_result { IOS_ZERO_OK, IOS_ZERO_SKIPPED, IOS_ZERO_READFAIL, IOS_ZERO_STALE };
+struct ios_zero_probe_stats
+{
+    unsigned long eligible, reads, skipped, readfail, stale;
+};
+static struct ios_zero_probe_stats ios_zero_probes[2][2];
+static int ios_zero_probe_sampling = -1;
+
+static int ios_zero_probe_begin( enum ios_zero_probe_kind kind, int hi )
+{
+    struct ios_zero_probe_stats *stats = &ios_zero_probes[kind][hi];
+    if (ios_zero_probe_sampling < 0)
+    {
+        const char *value = getenv( "MADEIRA_VM_ZERO_SAMPLE" );
+        ios_zero_probe_sampling = value && !strcmp( value, "1" );
+        dprintf( 2, "[vm-zero-probe-config] mode=%s env=%s first=8 interval=4096 "
+                 "skipped=unverified\n", ios_zero_probe_sampling ? "sample" : "full",
+                 !value ? "unset" : (!strcmp( value, "0" ) || !strcmp( value, "1" )) ? "valid" : "invalid" );
+    }
+    stats->eligible++;
+    if (ios_zero_probe_sampling && stats->eligible > 8 && (stats->eligible % 4096) != 0)
+    {
+        stats->skipped++;
+        return 0;
+    }
+    stats->reads++;
+    return 1;
+}
+
+static int ios_zero_probe_report( enum ios_zero_probe_kind kind, int hi, enum ios_zero_probe_result result,
+                                  const void *base, size_t size, const char *branch )
+{
+    static const char *states[] = { "zero-read", "skipped-unverified", "readfail", "stale" };
+    struct ios_zero_probe_stats *stats = &ios_zero_probes[kind][hi];
+    unsigned long anomaly = 0;
+    if (result == IOS_ZERO_READFAIL) anomaly = ++stats->readfail;
+    if (result == IOS_ZERO_STALE) anomaly = ++stats->stale;
+    if (stats->eligible > 8 && (stats->eligible % 4096) != 0 &&
+        !(result == IOS_ZERO_SKIPPED && stats->skipped == 1) &&
+        !(anomaly && (anomaly <= 8 || (anomaly % 4096) == 0))) return 0;
+    dprintf( 2, "[vm-zero-probe] kind=%s band=%s mode=%s state=%s base=%p size=0x%lx branch=%s "
+             "eligible=%lu reads=%lu skipped=%lu readfail=%lu stale=%lu\n",
+             kind == IOS_ZERO_COMMIT ? "commit" : "decommit", hi ? "arena/pool" : "GUEST",
+             ios_zero_probe_sampling ? "sample" : "full", states[result], base, (unsigned long)size, branch,
+             stats->eligible, stats->reads, stats->skipped, stats->readfail, stats->stale );
+    return 1;
+}
+
+/* Format only the supplied observed bytes; never pad a short snapshot with
+ * values that could be mistaken for captured data. out holds at most 8 bytes. */
+static void ios_zero_probe_bytes( const unsigned char *bytes, size_t count, char out[24] )
+{
+    static const char hex[] = "0123456789abcdef";
+    size_t i;
+    char *p = out;
+    for (i = 0; i < count && i < 8; i++)
+    {
+        if (i) *p++ = ' ';
+        *p++ = hex[bytes[i] >> 4];
+        *p++ = hex[bytes[i] & 15];
+    }
+    *p = 0;
+}
+
+/* Return accounting only: no read-back, page touch or NTSTATUS change. */
+static void ios_zero_probe_remap_result( void *base, size_t size, void *returned, int remap_errno )
+{
+    static struct { unsigned long calls, ok, fail; int last_fail_errno; } stats[2];
+    int hi = ios_is_arena_addr( base );
+    int failed = returned != base;
+    unsigned long calls = ++stats[hi].calls;
+    if (failed) { stats[hi].fail++; stats[hi].last_fail_errno = remap_errno; }
+    else stats[hi].ok++;
+    if (calls <= 8 || (calls % 4096) == 0 ||
+        (failed && (stats[hi].fail <= 8 || (stats[hi].fail % 4096) == 0)))
+        dprintf( 2, "[decommit-remap] band=%s state=%s base=%p size=0x%lx returned=%p "
+                 "calls=%lu ok=%lu fail=%lu last_fail_errno=%d (no read-back)\n",
+                 hi ? "arena/pool" : "GUEST", failed ? "fail" : "ok", base, (unsigned long)size, returned,
+                 calls, stats[hi].ok, stats[hi].fail, stats[hi].last_fail_errno );
+}
+/* zero-read probe core end */
+
 /***********************************************************************
  *           ios_verify_commit_zero      (iOS-Madeira ml293, task #52)
  *
@@ -14226,9 +14585,15 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
      * anomaly is logged, only the uninteresting OK lines are rate-limited, and
      * every line carries the running totals -- so a silent log can never be
      * mistaken for a clean one. */
-    static unsigned long ck_hi, ck_lo, stale_hi, stale_lo, recommit_n;
+    static unsigned long recommit_n;
+    const struct ios_zero_probe_stats *guest = &ios_zero_probes[IOS_ZERO_COMMIT][0];
+    const struct ios_zero_probe_stats *arena = &ios_zero_probes[IOS_ZERO_COMMIT][1];
     unsigned long seq;
     int hi;
+
+    /* Sampling gates the read, not only the log. Totals retain every eligible
+     * event; unread/failed reads never count as confirmed nonzero data. The
+     * original anomaly markers remain, with bounded reports and full totals. */
 
     if (!base || !size) return;
     if (protect & (PAGE_NOACCESS | PAGE_GUARD)) return;
@@ -14250,7 +14615,12 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
     { extern int ios_swap_overlaps_probe( const void *, size_t ); if (ios_swap_overlaps_probe( base, size )) return; }
 
     hi = ios_is_arena_addr( base );
-    seq = hi ? ++ck_hi : ++ck_lo;
+    if (!ios_zero_probe_begin( IOS_ZERO_COMMIT, hi ))
+    {
+        ios_zero_probe_report( IOS_ZERO_COMMIT, hi, IOS_ZERO_SKIPPED, base, size, "fresh-commit" );
+        return;
+    }
+    seq = ios_zero_probes[IOS_ZERO_COMMIT][hi].eligible;
     {
         size_t chk = size < 64 ? (size_t)size : 64;
         unsigned char snap[64];
@@ -14290,6 +14660,8 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
                                     (mach_vm_size_t)chk, (mach_vm_address_t)(uintptr_t)snap,
                                     &got ) != KERN_SUCCESS || got != (mach_vm_size_t)chk)
         {
+            if (!ios_zero_probe_report( IOS_ZERO_COMMIT, hi, IOS_ZERO_READFAIL, base, size, "fresh-commit" ))
+                return;
             BYTE hv = get_host_page_vprot( base );
             mach_vm_address_t ra = (mach_vm_address_t)(uintptr_t)base;
             mach_vm_size_t rs = 0;
@@ -14299,7 +14671,6 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
             int have_region = (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
                                                (vm_region_info_t)&ri, &rc, &ro ) == KERN_SUCCESS);
 
-            if (hi) stale_hi++; else stale_lo++;
             dprintf( 2, "[commit-noaccess] #%lu %s *** COMMIT SUCCEEDED BUT PAGE IS UNREADABLE *** "
                      "base=%p size=0x%lx protect=0x%x host_page_vprot=0x%02x unix_prot=0x%x "
                      "region=0x%llx+0x%llx prot=%d max=%d checked=%lu/%lu stale=%lu/%lu "
@@ -14309,19 +14680,19 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
                      have_region ? (unsigned long long)ra : 0ull,
                      have_region ? (unsigned long long)rs : 0ull,
                      have_region ? ri.protection : -1, have_region ? ri.max_protection : -1,
-                     ck_lo, ck_hi, stale_lo, stale_hi, recommit_n );
+                     guest->reads, arena->reads, guest->stale, arena->stale, recommit_n );
             return;
         }
         nz = ios_first_nonzero( snap, chk );
         if (nz < 0)
         {
             /* boring: first few, then sparse -- but the totals ride along */
-            if (seq <= 8 || (seq % 4096) == 0)
+            if (ios_zero_probe_report( IOS_ZERO_COMMIT, hi, IOS_ZERO_OK, base, size, "fresh-commit" ))
                 dprintf( 2, "[commit-zero] #%lu %s OK base=%p size=0x%lx protect=0x%x "
                          "(zero) checked=%lu/%lu stale=%lu/%lu recommit=%lu rev=ml546\n",
                          seq, hi ? "arena/pool" : "GUEST",
                          base, (unsigned long)size, (unsigned)protect,
-                         ck_lo, ck_hi, stale_lo, stale_hi, recommit_n );
+                         guest->reads, arena->reads, guest->stale, arena->stale, recommit_n );
         }
         else
         {
@@ -14329,14 +14700,19 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
              * first_nonzero=+0x8 -- so it printed eight zeros and told us nothing
              * about the actual stale content. Print from the offending offset. */
             const unsigned char *b = snap + nz;      /* ml981: the Mach snapshot, same bytes */
-            if (hi) stale_hi++; else stale_lo++;      /* ALWAYS logged: this is the signal */
+            size_t bytes_count = chk - (size_t)nz;
+            char bytes[24];
+            if (!ios_zero_probe_report( IOS_ZERO_COMMIT, hi, IOS_ZERO_STALE, base, size, "fresh-commit" ))
+                return;
+            if (bytes_count > 8) bytes_count = 8;
+            ios_zero_probe_bytes( b, bytes_count, bytes );
             dprintf( 2, "[commit-zero] #%lu %s *** STALE ON COMMIT *** base=%p size=0x%lx "
                      "protect=0x%x first_nonzero=+0x%lx checked=%lu/%lu stale=%lu/%lu recommit=%lu "
-                     "bytes@nz=%02x %02x %02x %02x %02x %02x %02x %02x rev=ml546\n",
+                     "bytes@nz=%s bytes_count=%lu rev=ml546\n",
                      seq, hi ? "arena/pool" : "GUEST",
                      base, (unsigned long)size, (unsigned)protect, (unsigned long)nz,
-                     ck_lo, ck_hi, stale_lo, stale_hi, recommit_n,
-                     b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7] );
+                     guest->reads, arena->reads, guest->stale, arena->stale, recommit_n,
+                     bytes, (unsigned long)bytes_count );
         }
     }
 }
@@ -15204,21 +15580,97 @@ static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t st
 }
 
 
+#ifdef WINE_IOS
+/* Opt-in namespace diagnosis only. First 64 records, then powers of two for
+ * consecutive queries of the same address/identity at each stage. No query
+ * result, mapping protection or server request is changed by this trace. */
+static void ios_vm_query_trace( unsigned int stage, HANDLE process, const void *addr,
+                                const struct file_view *view, unsigned int status,
+                                SIZE_T reply_size, int committed,
+                                const MEMORY_BASIC_INFORMATION *info )
+{
+    static int enabled = -1;
+    static unsigned long long sequence;
+    static _Thread_local struct
+    {
+        const void *addr, *peb;
+        HANDLE process;
+        DWORD pid;
+        unsigned long long repeats;
+    } seen[5];
+    static const char *names[] = { "commit-request", "commit-reply", "fill-result", "query", "query-result" };
+    TEB *teb;
+    void *peb;
+    DWORD pid, tid;
+    unsigned long long seq, repeats;
+    int on = __atomic_load_n( &enabled, __ATOMIC_RELAXED );
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_VM_QUERY_TRACE" );
+        on = e && e[0] == '1';
+        __atomic_store_n( &enabled, on, __ATOMIC_RELAXED );
+    }
+    if (!on || stage >= 5) return;
+    teb = NtCurrentTeb();
+    peb = ios_jit_current_peb();
+    pid = teb ? (DWORD)(ULONG_PTR)teb->ClientId.UniqueProcess : 0;
+    tid = teb ? (DWORD)(ULONG_PTR)teb->ClientId.UniqueThread : 0;
+    if (seen[stage].addr != addr || seen[stage].peb != peb ||
+        seen[stage].pid != pid || seen[stage].process != process)
+    {
+        seen[stage].addr = addr; seen[stage].peb = peb;
+        seen[stage].pid = pid; seen[stage].process = process;
+        seen[stage].repeats = 0;
+    }
+    repeats = ++seen[stage].repeats;
+    seq = __atomic_add_fetch( &sequence, 1, __ATOMIC_RELAXED );
+    if (seq > 64 && (repeats <= 1 || (repeats & (repeats - 1)))) return;
+    dprintf( 2, "[vm-query] #%llu stage=%s repeat=%llu peb=%p pid=%lu tid=%lu process=%p addr=%p "
+                "view=%p+%#lx flags=%#x sec_reserve=%d status=%#x reply_size=%#lx committed=%d "
+                "region=%#lx state=%#lx%s\n",
+             seq, names[stage], repeats, peb, (unsigned long)pid, (unsigned long)tid, process, addr,
+             view ? view->base : NULL, view ? (unsigned long)view->size : 0ul,
+             view ? view->protect : 0, view && (view->protect & SEC_RESERVE) ? 1 : 0,
+             status, (unsigned long)reply_size, committed,
+             info ? (unsigned long)info->RegionSize : 0ul, info ? (unsigned long)info->State : 0ul,
+             info && !info->RegionSize ? " ZERO_REGION" : "" );
+}
+#endif
+
 /***********************************************************************
  *           get_committed_size
  *
  * Get the size of the committed range with equal masked vprot bytes starting at base.
  * Also return the protections for the first page.
  */
-static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max_size, BYTE *vprot, BYTE vprot_mask )
+static SIZE_T get_committed_size_status( struct file_view *view, void *base, size_t max_size,
+                                        BYTE *vprot, BYTE vprot_mask, unsigned int *status_out )
 {
     SIZE_T offset, size;
 
     base = ROUND_ADDR( base, page_mask );
+    if (status_out)
+    {
+        uintptr_t b = (uintptr_t)base, vb = (uintptr_t)view->base;
+        *status_out = STATUS_SUCCESS;
+        *vprot = 0;
+        if (!view->size || view->size > UINTPTR_MAX - vb || b < vb || b - vb >= view->size)
+        {
+            *status_out = STATUS_INVALID_PARAMETER;
+            return 0;
+        }
+    }
     offset = (char *)base - (char *)view->base;
 
     if (view->protect & SEC_RESERVE)
     {
+        unsigned int query_status = STATUS_PENDING;
+#ifdef WINE_IOS
+        SIZE_T query_reply_size = 0;
+        int query_committed = -1;
+        ios_vm_query_trace( 0, NtCurrentProcess(), base, view, query_status, 0, -1, NULL );
+#endif
         size = 0;
 
         *vprot = get_page_vprot( base );
@@ -15227,10 +15679,24 @@ static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max
         {
             req->base   = wine_server_client_ptr( view->base );
             req->offset = offset;
-            if (!wine_server_call( req ))
+            query_status = wine_server_call( req );
+#ifdef WINE_IOS
+            if (!query_status)
+            {
+                query_reply_size = reply->size;
+                query_committed = reply->committed;
+            }
+#endif
+            if (status_out) *status_out = query_status;
+            if (!query_status)
             {
                 size = min( reply->size, max_size );
-                if (reply->committed)
+                if (status_out && size > view->size - offset)
+                {
+                    *status_out = STATUS_INVALID_PARAMETER;
+                    size = 0;
+                }
+                if (reply->committed && (!status_out || size))
                 {
                     *vprot |= VPROT_COMMITTED;
                     set_page_vprot_bits( base, size, VPROT_COMMITTED, 0 );
@@ -15238,6 +15704,10 @@ static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max
             }
         }
         SERVER_END_REQ;
+#ifdef WINE_IOS
+        ios_vm_query_trace( 1, NtCurrentProcess(), base, view, query_status,
+                            query_reply_size, query_committed, NULL );
+#endif
 
         if (!size || !(vprot_mask & ~VPROT_COMMITTED)) return size;
     }
@@ -15246,6 +15716,44 @@ static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max
     return get_vprot_range_size( base, size, vprot_mask, vprot );
 }
 
+
+/* Other memory operations retain their existing status-less semantics. */
+static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max_size,
+                                 BYTE *vprot, BYTE vprot_mask )
+{
+    return get_committed_size_status( view, base, max_size, vprot, vprot_mask, NULL );
+}
+
+#ifdef WINE_IOS
+/* A section view can belong to another pseudo-process in this shared Mach
+ * task. NOT_MAPPED_VIEW says it is absent from the current server namespace.
+ * Reserve its real span in VirtualQuery so a scanner progresses without
+ * reporting foreign bytes committed/readable or offering them as free space. */
+static unsigned int ios_basic_section_query_result( const struct file_view *view, const void *base,
+                                                    unsigned int status, MEMORY_BASIC_INFORMATION *info )
+{
+    uintptr_t b = (uintptr_t)base, vb = (uintptr_t)view->base;
+    SIZE_T remaining;
+    if (!(view->protect & SEC_RESERVE)) return status;
+    if (!view->size || view->size > UINTPTR_MAX - vb || b < vb || b - vb >= view->size)
+        return STATUS_INVALID_PARAMETER;
+    remaining = view->size - (b - vb);
+    if (status == (unsigned int)STATUS_NOT_MAPPED_VIEW)
+    {
+        info->BaseAddress = (void *)base;
+        info->AllocationBase = view->base;
+        info->RegionSize = remaining;
+        info->AllocationProtect = PAGE_NOACCESS;
+        info->State = MEM_RESERVE;
+        info->Protect = PAGE_NOACCESS;
+        info->Type = MEM_MAPPED;
+        return STATUS_SUCCESS;
+    }
+    if (status) return status;
+    if (!info->RegionSize || info->RegionSize > remaining) return STATUS_INVALID_PARAMETER;
+    return STATUS_SUCCESS;
+}
+#endif
 
 /***********************************************************************
  *           decommit_pages
@@ -16165,7 +16673,13 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
             else
             {
                 ios_swap_release_range( host_start, host_end - host_start, 0 );   /* ml1077 */
-                anon_mmap_fixed( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0 );
+                {
+                    void *returned = anon_mmap_fixed( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0 );
+                    int remap_errno = errno;
+                    ios_zero_probe_remap_result( host_start, host_end - host_start, returned,
+                                                 returned == MAP_FAILED ? remap_errno : 0 );
+                    errno = remap_errno;
+                }
                 dc_branch = "mmap-over";
                 dc_verify = host_start;
                 dc_vsize  = host_end - host_start;
@@ -16210,35 +16724,51 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
          * were never measured at all. Unbounded counters, every anomaly logged,
          * only the OK lines rate-limited, totals on every line. */
         {
-            static unsigned long dc_hi, dc_lo, dcbad_hi, dcbad_lo;
+            static unsigned long dc_hi, dc_lo;
+            const struct ios_zero_probe_stats *guest = &ios_zero_probes[IOS_ZERO_DECOMMIT][0];
+            const struct ios_zero_probe_stats *arena = &ios_zero_probes[IOS_ZERO_DECOMMIT][1];
             int dc_isarena = ios_is_arena_addr( base );
             unsigned long dc_n = dc_isarena ? ++dc_hi : ++dc_lo;
             {
                 if (dc_verify && dc_vsize)
                 {
-                    size_t chk = dc_vsize < 64 ? dc_vsize : 64;
-                    long nz = ios_first_nonzero( dc_verify, chk );
-                    if (nz < 0)
-                    {
-                        if (dc_n <= 8 || (dc_n % 4096) == 0)
-                            dprintf( 2, "[decommit-zero] #%lu %s OK base=%p size=0x%lx branch=%s "
-                                     "(zero) checked=%lu/%lu notzero=%lu/%lu rev=ml547\n",
-                                     dc_n, dc_isarena ? "arena/pool" : "GUEST",
-                                     base, (unsigned long)size, dc_branch,
-                                     dc_lo, dc_hi, dcbad_lo, dcbad_hi );
-                    }
+                    if (!ios_zero_probe_begin( IOS_ZERO_DECOMMIT, dc_isarena ))
+                        ios_zero_probe_report( IOS_ZERO_DECOMMIT, dc_isarena, IOS_ZERO_SKIPPED,
+                                               base, size, dc_branch );
                     else
                     {
-                        /* print from the OFFENDING offset, not from base */
-                        const unsigned char *b = (const unsigned char *)dc_verify + nz;
-                        if (dc_isarena) dcbad_hi++; else dcbad_lo++;
-                        dprintf( 2, "[decommit-zero] #%lu %s *** NOT ZEROED *** base=%p size=0x%lx "
-                                 "branch=%s first_nonzero=+0x%lx checked=%lu/%lu notzero=%lu/%lu "
-                                 "bytes@nz=%02x %02x %02x %02x %02x %02x %02x %02x rev=ml547\n",
-                                 dc_n, dc_isarena ? "arena/pool" : "GUEST",
-                                 base, (unsigned long)size, dc_branch, (unsigned long)nz,
-                                 dc_lo, dc_hi, dcbad_lo, dcbad_hi,
-                                 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7] );
+                        size_t chk = dc_vsize < 64 ? dc_vsize : 64;
+                        long nz = ios_first_nonzero( dc_verify, chk );
+                        if (nz < 0)
+                        {
+                            if (ios_zero_probe_report( IOS_ZERO_DECOMMIT, dc_isarena, IOS_ZERO_OK,
+                                                       base, size, dc_branch ))
+                                dprintf( 2, "[decommit-zero] #%lu %s OK base=%p size=0x%lx branch=%s "
+                                         "(zero) checked=%lu/%lu notzero=%lu/%lu rev=ml547\n",
+                                         dc_n, dc_isarena ? "arena/pool" : "GUEST",
+                                         base, (unsigned long)size, dc_branch,
+                                         guest->reads, arena->reads, guest->stale, arena->stale );
+                        }
+                        else
+                        {
+                            /* print from the OFFENDING offset, not from base */
+                            const unsigned char *b = (const unsigned char *)dc_verify + nz;
+                            size_t bytes_count = chk - (size_t)nz;
+                            char bytes[24];
+                            if (ios_zero_probe_report( IOS_ZERO_DECOMMIT, dc_isarena, IOS_ZERO_STALE,
+                                                       base, size, dc_branch ))
+                            {
+                                if (bytes_count > 8) bytes_count = 8;
+                                ios_zero_probe_bytes( b, bytes_count, bytes );
+                                dprintf( 2, "[decommit-zero] #%lu %s *** NOT ZEROED *** base=%p size=0x%lx "
+                                         "branch=%s first_nonzero=+0x%lx checked=%lu/%lu notzero=%lu/%lu "
+                                         "bytes@nz=%s bytes_count=%lu rev=ml547\n",
+                                         dc_n, dc_isarena ? "arena/pool" : "GUEST",
+                                         base, (unsigned long)size, dc_branch, (unsigned long)nz,
+                                         guest->reads, arena->reads, guest->stale, arena->stale,
+                                         bytes, (unsigned long)bytes_count );
+                            }
+                        }
                     }
                 }
                 else if (!strcmp( dc_branch, "swap-hole" ))
@@ -16296,6 +16826,7 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
                  work_us, census_us );
     }
 
+    ios_vm_alloc_trace( 1, base, size, MEM_DECOMMIT, 0, view, -1, -1, STATUS_SUCCESS );
     set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
     if (host_start < host_end) kernel_writewatch_register_range( view, host_start, host_end - host_start );
     return STATUS_SUCCESS;
@@ -17636,6 +18167,16 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
     const ULONG_PTR wow_base = 0;
     const BOOL wow_image = FALSE;
 #endif
+    /* map_view's kernel-pick escape checks the user limit. An opt-in wide
+     * user layout above the host limit must retain bounded image placement. */
+    BOOL relax_furniture = !wow_image && !limit_high &&
+                          limit_low <= (ULONG_PTR)address_space_start &&
+                          is_machine_64bit( image_info->machine ) &&
+                          (image_info->image_flags & IMAGE_FLAGS_ImageDynamicallyRelocated) &&
+                          !(image_info->image_charact & IMAGE_FILE_RELOCS_STRIPPED) &&
+                          !(alloc_type & ~MEM_TOP_DOWN) && ios_furniture_ceiling != 0 &&
+                          user_space_limit <= host_addr_space_limit &&
+                          (void *)ios_furniture_ceiling < min( user_space_limit, host_addr_space_limit );
 
     if (wow_image)
     {
@@ -17803,7 +18344,19 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
 
     /* then any suitable address */
 
-    return map_view( view_ret, NULL, size, top_down ? MEM_TOP_DOWN : 0, vprot, limit_low, limit_high, 0 );
+    status = map_view( view_ret, NULL, size, top_down ? MEM_TOP_DOWN : 0, vprot, limit_low, limit_high, 0 );
+    if (status == STATUS_NO_MEMORY && relax_furniture)
+    {
+        /* Our image ceiling is advisory, just like map_view's own ceiling.
+         * Passing it as limit_high hid that provenance and prevented the
+         * existing escape path when the low band was fragmented. Withdraw
+         * only our limit for a relocatable 64-bit image; map_view still keeps
+         * the real user/host limits, reserved FEX arena and JIT pool guards. */
+        dprintf( 2, "[img-va] advisory ceiling exhausted for %p bytes; retrying relocatable "
+                    "64-bit image with map_view's soft ceiling\n", (void *)size );
+        status = map_view( view_ret, NULL, size, top_down ? MEM_TOP_DOWN : 0, vprot, limit_low, 0, 0 );
+    }
+    return status;
 }
 
 
@@ -18933,6 +19486,8 @@ TEB *virtual_alloc_first_teb(void)
     peb = (PEB *)((char *)teb_block + 31 * block_size + (is_win64 ? 0 : page_size));
 #ifdef WINE_IOS
     ios_session_peb = peb;   /* see ios_wow_window_teardown */
+    if (!ios_native_bind_current( peb ))
+        fatal_error( "native session admission failed before initial PEB binding\n" );
 #endif
     teb = init_teb( ptr, FALSE );
     pthread_key_create( &teb_key, NULL );
@@ -19129,12 +19684,17 @@ void virtual_free_teb( TEB *teb )
     {
         size = 0;
 #ifdef WINE_IOS
-        /* guest -> host: a WoW thread's 32-bit stack pointer is a guest
-         * address.  Outside a window ios_wow_base() is 0 and this is the
-         * classic identity. */
-        ptr = (char *)ptr + ios_wow_base();
+        /* exit_thread's prev_teb handoff can free another pseudo-process's
+         * thread. Translate its guest stack with the TARGET TEB's window,
+         * just like the TEB free-list routing below. The freeing thread's
+         * window may contain a live stack at the same guest offset.
+         * A dead/leaked/placeholder window owns its teardown; never turn its
+         * stale guest offset into a release in the caller or session. */
+        struct ios_wow_window *wow = ios_wow_live_slot_for_addr( teb );
+        if (wow) ptr = (char *)ptr + wow->base;
+        else if (ios_wow_addr_in_any_window( teb )) ptr = NULL;
 #endif
-        NtFreeVirtualMemory( GetCurrentProcess(), &ptr, &size, MEM_RELEASE );
+        if (ptr) NtFreeVirtualMemory( GetCurrentProcess(), &ptr, &size, MEM_RELEASE );
     }
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
@@ -20881,6 +21441,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
         }
         /* ml293 (task #52): PA-arena recommit must read back as zero. */
         if (!status) ios_verify_commit_zero( base, size, protect, was_committed );
+        if (!status) ios_vm_alloc_trace( 0, base, size, type, protect, view, any_committed, was_committed, status );
     }
 
     if (!status && (attributes & MEM_EXTENDED_PARAMETER_EC_CODE))
@@ -24188,12 +24749,13 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
     size = ROUND_SIZE( addr, size, page_mask );
     base = ROUND_ADDR( addr, page_mask );
 
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+
 #ifdef WINE_IOS
-    /* ml1244: the loader's IAT restore call; the thunks are still writable here */
+    /* The loader's IAT restore call; thunks are still writable. View-based
+     * classification for an unpooled importer requires virtual_mutex. */
     ios_x64_iat_bind_live_data( base, size );
 #endif
-
-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
     if ((view = find_view( base, size )))
     {
@@ -24761,6 +25323,7 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
     struct file_view *view;
     BOOL fake_reserved;
     sigset_t sigset;
+    unsigned int status = STATUS_SUCCESS;
 
     base = ROUND_ADDR( addr, page_mask );
 
@@ -24800,17 +25363,29 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
         BYTE vprot;
 
         info->AllocationBase = alloc_base;
-        info->RegionSize = get_committed_size( view, base, ~(size_t)0, &vprot, ~VPROT_WRITEWATCH );
+#ifdef WINE_IOS
+        if (view->protect & SEC_RESERVE)
+            info->RegionSize = get_committed_size_status( view, base, ~(size_t)0, &vprot,
+                                                         ~VPROT_WRITEWATCH, &status );
+        else
+#endif
+            info->RegionSize = get_committed_size( view, base, ~(size_t)0, &vprot, ~VPROT_WRITEWATCH );
         info->State = (vprot & VPROT_COMMITTED) ? MEM_COMMIT : MEM_RESERVE;
         info->Protect = (vprot & VPROT_COMMITTED) ? get_win32_prot( vprot, view->protect ) : 0;
         info->AllocationProtect = get_win32_prot( view->protect, view->protect );
         if (view->protect & SEC_IMAGE) info->Type = MEM_IMAGE;
         else if (view->protect & (SEC_FILE | SEC_RESERVE | SEC_COMMIT)) info->Type = MEM_MAPPED;
         else info->Type = MEM_PRIVATE;
+#ifdef WINE_IOS
+        status = ios_basic_section_query_result( view, base, status, info );
+#endif
     }
+#ifdef WINE_IOS
+    ios_vm_query_trace( 2, NtCurrentProcess(), addr, view, status, 0, -1, info );
+#endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
 
-    return STATUS_SUCCESS;
+    return status;
 }
 
 /* get basic information about a memory block */
@@ -24819,6 +25394,9 @@ static unsigned int get_basic_memory_info( HANDLE process, LPCVOID addr,
                                            SIZE_T len, SIZE_T *res_len )
 {
     unsigned int status;
+#ifdef WINE_IOS
+    ios_vm_query_trace( 3, process, addr, NULL, STATUS_PENDING, 0, -1, NULL );
+#endif
 
     if (len < sizeof(*info))
         return STATUS_INFO_LENGTH_MISMATCH;
@@ -24848,10 +25426,18 @@ static unsigned int get_basic_memory_info( HANDLE process, LPCVOID addr,
                 return STATUS_INVALID_PARAMETER;  /* FIXME */
             if (res_len) *res_len = sizeof(*info);
         }
+#ifdef WINE_IOS
+        ios_vm_query_trace( 4, process, addr, NULL, result.virtual_query.status, 0, -1,
+                            result.virtual_query.status == STATUS_SUCCESS ? info : NULL );
+#endif
         return result.virtual_query.status;
     }
 
-    if ((status = fill_basic_memory_info( addr, info ))) return status;
+    status = fill_basic_memory_info( addr, info );
+#ifdef WINE_IOS
+    ios_vm_query_trace( 4, process, addr, NULL, status, 0, -1, status ? NULL : info );
+#endif
+    if (status) return status;
 
     if (res_len) *res_len = sizeof(*info);
     return STATUS_SUCCESS;
@@ -25740,40 +26326,21 @@ NTSTATUS WINAPI NtUnmapViewOfSection( HANDLE process, PVOID addr )
 }
 
 
-/***********************************************************************
- *           ios_retire_own_fixed_base_image                      (ml988)
- *
- * Phase 1 of the fixed-base ownership handoff: retire THIS pseudo-process's
- * main image as it exits, so the next generation of a non-relocatable exe can
- * have the one address it is able to run at.
- *
- * Called from process_exit_wrapper BEFORE the master socket closes, because
- * NtUnmapViewOfSection's SERVER_START_REQ(unmap_view) needs a live connection
- * and this is the last moment we have one while still on the owning thread.
- *
- * It does NOT announce readiness. The address stays unclaimable until
- * ios_exe_win_mark_ready() runs after ios_jit_reclaim_process, because until
- * then this generation's pool mappings and FEX translations still exist and a
- * new claimant taking the same VA would be racing them.
- *
- * The hold is anon_mmap_tryfixed (no-clobber), never anon_mmap_fixed: the unmap
- * drops virtual_mutex before returning, so the interval is genuinely free for a
- * moment and another thread may legitimately take it. That is reported as a
- * named loss, never overwritten.
- *
- * MADEIRA_NO_IMAGE_RETIRE=1 disables the handoff entirely.
- */
-void ios_retire_own_fixed_base_image( void *dying_peb )
+/* Retire the exact exclusive fixed-base image after native quiescence.
+ * Server EOF has already removed the Windows process's server-side view.
+ * The native observer can delete this matching local view without a Wine
+ * thread identity or RPC, and releases no interval belonging to another owner. */
+static void ios_retire_quiescent_fixed_base_image( void *dying_peb )
 {
-    static int disabled = -1;
+    struct file_view *view;
     void *base;
     size_t size;
     unsigned gen;
-    unsigned int status;
 
-    if (disabled < 0) disabled = getenv( "MADEIRA_NO_IMAGE_RETIRE" ) ? 1 : 0;
-    if (disabled || !dying_peb) return;
-
+    if (!dying_peb || getenv( "MADEIRA_NO_IMAGE_RETIRE" )) return;
+    /* Caller holds virtual_mutex, after every owned native endpoint and
+     * callback lease has completed. Server EOF has already removed the
+     * process's server-side views; an observer must not issue a Wine RPC. */
     pthread_mutex_lock( &ios_exewin_lock );
     if (ios_exewin_st != IOS_EXEWIN_OWNED || !ios_exe_win_img_base ||
         dying_peb != ios_exe_win_img_peb)
@@ -25783,96 +26350,68 @@ void ios_retire_own_fixed_base_image( void *dying_peb )
     }
     base = ios_exe_win_img_base;
     size = ios_exe_win_img_size;
-    gen  = ios_exe_win_generation;
-    ios_exewin_st = IOS_EXEWIN_RETIRING;    /* claims refused from here on */
-    pthread_mutex_unlock( &ios_exewin_lock );
-
-    dprintf( 2, "ml988: gen %u owns the fixed-base main image %p+%#lx (peb=%p) and is exiting "
-             "-- OWNED -> RETIRING, unmapping through NtUnmapViewOfSection\n",
-             gen, base, (unsigned long)size, dying_peb );
-
-    /* Not holding ios_exewin_lock here: this takes virtual_mutex, and the leaf
-     * lock must never be held while acquiring it. */
-    ios_retire_trace_armed = 1;                       /* ml989 */
-    ios_retire_mark( "U0>\n" );                       /* about to call the unmap */
-    status = NtUnmapViewOfSection( NtCurrentProcess(), base );
-    ios_retire_mark( "U1<\n" );                       /* the unmap RETURNED */
-    ios_retire_trace_armed = 0;
-    dprintf( 2, "ml988: NtUnmapViewOfSection(%p) = %#x\n", base, status );
-    dprintf( 2, "ml989: retire-trace fd=%d last write()=%d (markers are independent of fd 2)\n",
-             ios_retire_trace_fd, ios_retire_trace_lastwr );
-
-    if (status)
+    gen = ios_exe_win_generation;
+    view = find_view( base, 0 );
+    if (!view || view->base != base || view->size != size ||
+        !(view->protect & SEC_IMAGE) || (view->protect & VPROT_SYSTEM))
     {
-        pthread_mutex_lock( &ios_exewin_lock );
-        ios_exewin_st = IOS_EXEWIN_OWNED;   /* nothing changed; keep the old owner */
         pthread_mutex_unlock( &ios_exewin_lock );
-        dprintf( 2, "ml988: unmap refused -- staying OWNED by gen %u; the next generation will "
-                 "be placed elsewhere and this defect is NOT worked around\n", gen );
+        dprintf( 2, "[native-life] fixed image gen=%u has no exclusive matching view; interval retained\n", gen );
         return;
     }
-
-    if (anon_mmap_tryfixed( base, size, PROT_NONE, MAP_NORESERVE ) == MAP_FAILED)
-    {
-        pthread_mutex_lock( &ios_exewin_lock );
-        ios_exewin_st = IOS_EXEWIN_FREE;
-        ios_exe_win_img_base = NULL;
-        ios_exe_win_img_size = 0;
-        ios_exe_win_img_peb  = NULL;
-        ios_exe_win_img_dead = 0;
-        pthread_mutex_unlock( &ios_exewin_lock );
-        dprintf( 2, "ml988: LOST the interval %p+%#lx (errno=%d) -- another allocation took it "
-                 "in the gap after the unmap. Leaving it alone; a MAP_FIXED hold here would "
-                 "have destroyed it\n", base, (unsigned long)size, errno );
-        return;
-    }
-
-    pthread_mutex_lock( &ios_exewin_lock );
-    ios_exe_win_held_base = base;
-    ios_exe_win_held_size = size;
-    ios_exe_win_img_base  = NULL;
-    ios_exe_win_img_size  = 0;
-    ios_exe_win_img_peb   = NULL;
-    ios_exe_win_img_dead  = 0;
-    ios_exewin_st         = IOS_EXEWIN_HELD_NOT_READY;
+    ios_exewin_st = IOS_EXEWIN_RETIRING;
     pthread_mutex_unlock( &ios_exewin_lock );
 
-    dprintf( 2, "ml988: gen %u's image retired; %p+%#lx HELD PROT_NONE (no-overwrite) "
-             "-- RETIRING -> HELD_NOT_READY, not claimable until the old generation's pool "
-             "mappings are reclaimed\n", gen, base, (unsigned long)size );
-}
-
-
-/***********************************************************************
- *           ios_exe_win_mark_ready                               (ml988)
- *
- * Phase 2: the exiting generation's pool mappings and anon aliases have been
- * reclaimed, so the held interval may now be handed to a new claimant. Called
- * from process_exit_wrapper immediately after ios_jit_reclaim_process.
- *
- * This is NOT a proof that every native thread of that process has stopped --
- * thread_ios.c:1764 documents that a non-main-thread exit can leave siblings
- * running, and the pool's reuse grace is a delay, not a lifetime proof. It is
- * the strongest barrier currently available, and it is strictly stronger than
- * the server EOF that ml987 effectively relied on.
- */
-void ios_exe_win_mark_ready( void *dead_peb )
-{
-    int promoted = 0;
-
+    delete_view( view );
+    /* No-clobber reservation: never overwrite a different native allocation
+     * that acquired the gap after unmap. */
+    int held = anon_mmap_tryfixed( base, size, PROT_NONE, MAP_NORESERVE ) != MAP_FAILED;
     pthread_mutex_lock( &ios_exewin_lock );
-    if (ios_exewin_st == IOS_EXEWIN_HELD_NOT_READY)
+    ios_exe_win_img_base = NULL;
+    ios_exe_win_img_size = 0;
+    ios_exe_win_img_peb = NULL;
+    ios_exe_win_img_dead = 0;
+    if (held)
     {
+        ios_exe_win_held_base = base;
+        ios_exe_win_held_size = size;
         ios_exewin_st = IOS_EXEWIN_HELD_READY;
-        promoted = 1;
     }
+    else ios_exewin_st = IOS_EXEWIN_FREE;
     pthread_mutex_unlock( &ios_exewin_lock );
-
-    if (promoted)
-        dprintf( 2, "ml988: pool mappings for peb=%p reclaimed -- %p+%#lx HELD_NOT_READY -> "
-                 "HELD_READY; the next >=64MB fixed-base map may take it\n",
-                 dead_peb, ios_exe_win_held_base, (unsigned long)ios_exe_win_held_size );
+    dprintf( 2, "[native-life] fixed image gen=%u %p+%#lx quiescent; %s\n",
+             gen, base, (unsigned long)size, held ? "held for reuse" : "gap acquired elsewhere, left alone" );
 }
+
+/* The only destructive process retirement entry. The lifetime core calls it
+ * outside its mutex after native death; address reuse remains blocked until
+ * this callback returns. There is no elapsed-time completion rule. */
+void ios_jit_finish_process( void *dead_peb, uint64_t generation )
+{
+    sigset_t mask;
+    extern void ios_subfloor_release_owner( void *owner );
+    if (dead_peb)
+    {
+        extern void ios_server_finish_process( void *, int );
+        ios_server_finish_process( dead_peb, dead_peb == ios_session_peb );
+        server_enter_uninterrupted_section( &virtual_mutex, &mask );
+        ios_jit_reclaim_quiescent( dead_peb );
+        ios_retire_quiescent_fixed_base_image( dead_peb );
+        ios_subfloor_release_owner( dead_peb );
+        server_leave_uninterrupted_section( &virtual_mutex, &mask );
+    }
+    ios_wow_window_finish_generation( generation );
+    dprintf( 2, "[native-life] COMPLETE gen=%llu peb=%p: native endpoints and callback leases drained\n",
+             (unsigned long long)generation, dead_peb );
+}
+
+/* Compatibility entry for native callers: a logical request never clears EC
+ * bits, aliases, mappings or allocation ownership on its caller's stack. */
+void ios_jit_reclaim_process( void *dead_peb )
+{
+    ios_native_retire_process( dead_peb );
+}
+
 
 /***********************************************************************
  *             NtUnmapViewOfSectionEx   (NTDLL.@)

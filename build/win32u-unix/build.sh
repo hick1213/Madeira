@@ -146,16 +146,23 @@ fi
 
 echo ""
 echo "=== Building libwin32u_unix.a ==="
-ar rcs "$OBJ_DIR/libwin32u_unix.a" "$OBJ_DIR"/*.o
+# Start from a fresh archive: ar rcs retains old members, including the
+# FreeType objects merged by the previous build.
+WIN32U_ARCHIVE_STAGE="$(mktemp -d "$OBJ_DIR/.win32u-archive-XXXXXX")"
+trap 'rm -rf "$WIN32U_ARCHIVE_STAGE"' EXIT
+ar rcs "$WIN32U_ARCHIVE_STAGE/libwin32u_unix.a" "$OBJ_DIR"/*.o
 
 # Merge the static freetype so the app link needs no project changes.
 if [ -f "$FREETYPE_DIR/build/libfreetype.a" ]; then
-    libtool -static -o "$OBJ_DIR/libwin32u_unix.a" \
-        "$OBJ_DIR/libwin32u_unix.a" "$FREETYPE_DIR/build/libfreetype.a" 2>/dev/null
+    libtool -static -o "$WIN32U_ARCHIVE_STAGE/merged.a" \
+        "$WIN32U_ARCHIVE_STAGE/libwin32u_unix.a" "$FREETYPE_DIR/build/libfreetype.a" 2>/dev/null
+    mv "$WIN32U_ARCHIVE_STAGE/merged.a" "$WIN32U_ARCHIVE_STAGE/libwin32u_unix.a"
     echo "merged libfreetype.a"
 else
     echo "WARNING: no libfreetype.a — fonts will be disabled"
 fi
+
+mv "$WIN32U_ARCHIVE_STAGE/libwin32u_unix.a" "$OBJ_DIR/libwin32u_unix.a"
 
 echo "Copying to app..."
 cp "$OBJ_DIR/libwin32u_unix.a" "$APP_LIB"

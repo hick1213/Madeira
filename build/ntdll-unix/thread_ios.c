@@ -78,6 +78,7 @@ volatile long long ios_affinity_sets;   /* ml1117 */
 #include "wine/debug.h"
 #include "unix_private.h"
 #include "ios_wow.h"
+#include "ios_native_lifetime.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(thread);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
@@ -1252,10 +1253,21 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
  *
  * Startup routine for a newly created thread.
  */
-static void start_thread( TEB *teb )
+struct ios_native_thread_start
 {
+    TEB *teb;
+    struct ios_native_reservation *reservation;
+};
+
+static void *start_thread( void *arg )
+{
+    struct ios_native_thread_start *native_start = arg;
+    TEB *teb = native_start->teb;
+    struct ios_native_reservation *reservation = native_start->reservation;
     struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
     BOOL suspend;
+
+    free( native_start );
 
     /* iOS-Madeira 2026-07-04 perf: promote guest threads to USER_INTERACTIVE
      * QoS. Default-QoS pthreads on iOS are E-core-eligible and get heavy
@@ -1299,6 +1311,7 @@ static void start_thread( TEB *teb )
                 (unsigned int)(ULONG_PTR)teb->ClientId.UniqueThread, raw, (void *)teb,
                 raw == teb ? "MATCH" : "MISMATCH");
     }
+    if (!ios_native_publish( reservation, teb )) abort_thread( 1 );
     server_init_thread( thread_data->start, &suspend );
     signal_start_thread( thread_data->start, thread_data->param, suspend, teb );
 }
@@ -1562,6 +1575,7 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     struct ntdll_thread_data *thread_data;
     DWORD tid = 0;
     int request_pipe[2];
+    struct ios_native_thread_start *native_start = NULL;
     TEB *teb;
     WOW_TEB *wow_teb;
     unsigned int status;
@@ -1702,7 +1716,12 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
 
     pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
 
+    native_start = calloc( 1, sizeof(*native_start) );
+    if (!native_start) { status = STATUS_NO_MEMORY; goto done; }
+    native_start->reservation = ios_native_thread_reserve( NtCurrentTeb()->Peb );
+    if (!native_start->reservation) { status = STATUS_THREAD_IS_TERMINATING; goto done; }
     if ((status = virtual_alloc_teb( &teb ))) goto done;
+    native_start->teb = teb;
 
     if ((status = init_thread_stack( teb, get_zero_bits_limit( zero_bits ), stack_reserve, stack_commit )))
     {
@@ -1731,15 +1750,21 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     pthread_attr_setguardsize( &pthread_attr, 0 );
     pthread_attr_setscope( &pthread_attr, PTHREAD_SCOPE_SYSTEM ); /* force creating a kernel thread */
     InterlockedIncrement( &nb_threads );
-    if (pthread_create( &pthread_id, &pthread_attr, (void * (*)(void *))start_thread, teb ))
+    if (pthread_create( &pthread_id, &pthread_attr, start_thread, native_start ))
     {
         InterlockedDecrement( &nb_threads );
         virtual_free_teb( teb );
         status = STATUS_NO_MEMORY;
     }
+    else native_start = NULL; /* the new thread now owns the reservation and wrapper */
     pthread_attr_destroy( &pthread_attr );
 
 done:
+    if (native_start)
+    {
+        ios_native_creation_failed( native_start->reservation );
+        free( native_start );
+    }
     pthread_sigmask( SIG_SETMASK, &sigset, NULL );
     if (status)
     {

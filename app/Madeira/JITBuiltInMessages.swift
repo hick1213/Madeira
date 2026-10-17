@@ -18,21 +18,22 @@ struct MadeiraJITRequest: Codable, Sendable {
     let targetPID: Int32?
     let pairingData: Data?
     let scriptBase64: String?
+    let rsdPort: UInt16?
 
-    static func prepare(pairingData: Data) -> MadeiraJITRequest {
+    static func prepare(pairingData: Data, rsdPort: UInt16 = 49152) -> MadeiraJITRequest {
         MadeiraJITRequest(operation: .prepare, targetPID: nil,
-                          pairingData: pairingData, scriptBase64: nil)
+                          pairingData: pairingData, scriptBase64: nil, rsdPort: rsdPort)
     }
 
     static func enable(targetPID: Int32, pairingData: Data,
-                       scriptBase64: String) -> MadeiraJITRequest {
+                       scriptBase64: String, rsdPort: UInt16 = 49152) -> MadeiraJITRequest {
         MadeiraJITRequest(operation: .enable, targetPID: targetPID,
-                          pairingData: pairingData, scriptBase64: scriptBase64)
+                          pairingData: pairingData, scriptBase64: scriptBase64, rsdPort: rsdPort)
     }
 
     static var resetDDI: MadeiraJITRequest {
         MadeiraJITRequest(operation: .resetDDI, targetPID: nil,
-                          pairingData: nil, scriptBase64: nil)
+                          pairingData: nil, scriptBase64: nil, rsdPort: nil)
     }
 
     struct Response: Codable, Sendable {

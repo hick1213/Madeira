@@ -90,9 +90,14 @@ install folder) instead of the fixed one other launches get. Play needs the
 game installed, no update running, and a program; no client components or
 sign-in.
 
-**Repair installed files** runs the download again for the current build: the
-downloader checks every chunk already on disk against its SHA-1 and fetches
-only what is missing or differs. **Update**, **Repair** and **Uninstall** are
+**校验并补齐游戏文件（可选）** is an independent content tool, not a warning
+or the next step after runtime repair. It checks every local chunk against the
+current Steam build before requesting any game chunk, including chunks recorded
+in an interrupted download's journal. Only missing or changed chunks are fetched;
+the current build can include updates. Local checking has its own phase, and
+download progress separates retained bytes from bytes fetched for this attempt.
+An unchanged installation does not benchmark or download game chunks.
+**Update**, content checking and **Uninstall** are
 offered for games in Madeira's own library folder; games Steam's client
 installed in another library folder are shown and played, but Madeira does not
 modify them. **Uninstall** also removes the game's library entry.
@@ -104,6 +109,30 @@ partial files are deleted; an update is only stopped), the free space on the
 device and a link to the game's Steam Store page. When the download finishes,
 the game becomes a library entry and the sheet's button reads **Open**, which
 opens its Game details page.
+
+The download sheet defaults to **下载后检查并修复可支持的运行库**. Its
+**下载并准备运行环境** action first completes game content, then checks the
+actual selected Windows startup program and automatically prepares supported,
+explicitly missing Microsoft runtimes through the existing verified repair flow.
+The program's runtime declaration may only become available during the download,
+so this dependency check runs after content completion rather than guessing from
+the game name. It never starts the game automatically. Unknown requirements and
+unsupported runtimes remain visible without guessed installs. JIT and a restart
+may still require user action. The account-bound request persists across a
+background/used-session deferral; unlaunched plans drain cleanup before retry.
+Opting out, cancelling or uninstalling removes that game's pending request.
+The independent content-check tool does not request runtime setup.
+
+Recovered download rows distinguish a resumable transfer from an empty content
+check. When every journal is empty and matches the installed depot manifests,
+the cached current build matches the completed install record, all four byte
+counters are zero, and the physical install directory exists, an empty check is
+not restored as a download. This is a display decision, not a repair-success
+claim; no journal, game file or Steam record is deleted or changed. Unknown or
+newer builds, nonempty progress and missing/unsafe metadata remain recoverable.
+Fresh metadata reconciles only passive recovery-created paused rows. Explicit
+user pauses, queued or active work are retained, and an I/O failure cannot count
+as completion evidence.
 
 Sign-in is not new: Settings › Steam and first-run setup (`docs/STEAM_SIGNIN.md`,
 `docs/LIBRARY.md`) sign in and out. Signing in fetches the library; signing out

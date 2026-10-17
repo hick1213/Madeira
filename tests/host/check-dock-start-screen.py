@@ -52,7 +52,7 @@ rules = screen[screen.index('// MARK: - Rules'):screen.index('// MARK: - Model')
 require(screen.startswith('// SPDX-License-Identifier: GPL-3.0-or-later\n// Copyright 2026 125hz\n'
                           '// Madeira Converter Exception: see LICENSE-EXCEPTION.md\n'),
         'DockStartScreen.swift: GPL-3.0-or-later, Copyright 2026 125hz, Converter Exception')
-require('/* DockStartScreen.swift in Sources */,' in project and 'path = "DockStartScreen.swift"' in project,
+require('/* DockStartScreen.swift in Sources */,' in project and re.search(r'\bpath\s*=\s*"?DockStartScreen\.swift"?\s*;', project) is not None,
         'DockStartScreen.swift is built by the Xcode project')
 require(re.search(r'\bView\b|SwiftUI|MadeiraDock\.|MadeiraConfig|getenv', rules.replace('// MARK: - Rules', '')) is None,
         'the rules are Foundation-only and pure (switches are passed in)')

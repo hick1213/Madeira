@@ -4,6 +4,8 @@
 from pathlib import Path
 import plistlib
 import re
+import subprocess
+import tempfile
 
 root = Path(__file__).resolve().parents[2]
 app = root / "app/Madeira"
@@ -105,12 +107,118 @@ require("targetPID: targetPID" in helper_enable
 require('getenv("LC_HOME_PATH")' in host,
         "built-in JIT is disabled under LiveContainer")
 
+# Every developer launch uses the shared full-sequence entry. It must reject
+# a running session before requesting JIT, and continue only after attachment.
+# Removing the continuation or restoring the Library-only gate must fail here.
+developer_launch = function(content, "private func runWineFullSequence(")
+require("jitReadyForLaunch(inLibrary: library.enabled, entry: profile?.id," in developer_launch
+        and "then: { runWineFullSequence(profile: profile, preparation: preparation, externalContext: externalContext, epicLaunch: epicLaunch) }) else { return }" in developer_launch
+        and developer_launch.index("wine_process_is_running() == 0, wineserver_is_running() == 0")
+        < developer_launch.index("jitReadyForLaunch(")
+        < developer_launch.index("GameSessionWork.shared.reconcile()"),
+        "developer launch rejects a busy session, then enables JIT before starting Wine")
+launch_gate = function(content, "private func jitReadyForLaunch(")
+require("if let launch {" in launch_gate and "if inLibrary, let launch {" not in launch_gate,
+        "a developer launch continuation enables JIT outside the Library interface")
+launch_ended = function(content, "private func launchAfterJITEnded(")
+require("wineserver_is_running() == 0" in launch_ended,
+        "a pending launch does not start if a wineserver appeared during JIT setup")
+
+# Execute the actual continuation methods with isolated debugger/session inputs.
+# A failure, a second callback, or another session must never launch Wine.
+swift_test = r'''
+import Foundation
+enum JITStatus { case unknown, testing }
+enum StikJITHelper {
+    static var ready = false
+    static var flaggedWithoutDebugger = false
+    static let noDebuggerMessage = "no debugger"
+}
+var wineRunning: Int32 = 0
+var serverRunning: Int32 = 0
+func wine_process_is_running() -> Int32 { wineRunning }
+func wineserver_is_running() -> Int32 { serverRunning }
+final class Library {
+    var current: UUID?
+    var startingJIT: UUID?
+    var error: String?
+    var jitNotice: String?
+}
+final class Log { func log(_ text: String, level: Level = .info) {} }
+enum Level { case info, error }
+final class GameSessionWork {
+    static let shared = GameSessionWork()
+    var owned: Set<UUID> = []
+    var completed: [UUID] = []
+    func ownsPreparation(_ token: UUID) -> Bool { owned.contains(token) }
+    func completePreparation(_ token: UUID) {
+        owned.remove(token)
+        completed.append(token)
+    }
+}
+final class Harness {
+    var launchAfterJIT: (() -> Void)?
+    var launchAfterJITPreparation: UUID?
+    let library = Library()
+    let logStore = Log()
+    var jitStatus = JITStatus.unknown
+    var enables = 0
+    func enableJIT() { enables += 1; jitStatus = .testing }
+''' + launch_gate.replace("private func", "func", 1) + "\n" + launch_ended.replace("private func", "func", 1) + r'''
+}
+let h = Harness()
+var launches = 0
+precondition(!h.jitReadyForLaunch(inLibrary: false, then: { launches += 1 }))
+precondition(h.enables == 1 && launches == 0)
+// A second launch replaces the pending callback without another attach request.
+precondition(!h.jitReadyForLaunch(inLibrary: false, then: { launches += 10 }))
+precondition(h.enables == 1)
+StikJITHelper.ready = true
+h.launchAfterJITEnded(started: true)
+h.launchAfterJITEnded(started: true)
+precondition(launches == 10 && h.launchAfterJIT == nil)
+for blocked in 0..<4 {
+    h.launchAfterJIT = { launches += 100 }
+    StikJITHelper.ready = blocked != 1
+    wineRunning = blocked == 2 ? 1 : 0
+    serverRunning = blocked == 3 ? 1 : 0
+    h.launchAfterJITEnded(started: blocked != 0)
+    precondition(launches == 10 && h.launchAfterJIT == nil)
+}
+wineRunning = 0; serverRunning = 0; StikJITHelper.ready = true
+precondition(h.jitReadyForLaunch(inLibrary: false, then: { launches += 100 }))
+precondition(h.enables == 1 && h.launchAfterJIT == nil)
+let work = GameSessionWork.shared
+let preparation = UUID()
+work.owned.insert(preparation)
+StikJITHelper.ready = false
+precondition(!h.jitReadyForLaunch(inLibrary: false, preparation: preparation, then: { launches += 1 }))
+StikJITHelper.ready = true
+h.launchAfterJITEnded(started: true)
+precondition(launches == 11 && h.launchAfterJITPreparation == nil)
+let stale = UUID()
+StikJITHelper.ready = false
+precondition(!h.jitReadyForLaunch(inLibrary: false, preparation: stale, then: { launches += 100 }))
+StikJITHelper.ready = true
+h.launchAfterJITEnded(started: true)
+precondition(launches == 11 && h.launchAfterJIT == nil)
+StikJITHelper.ready = false
+precondition(!h.jitReadyForLaunch(inLibrary: false, preparation: preparation, then: { launches += 100 }))
+h.launchAfterJITEnded(started: false)
+precondition(launches == 11 && work.completed == [preparation] && !work.ownsPreparation(preparation))
+print("PASS: real JIT continuation handles developer context, replacement, failure and busy sessions")
+'''
+with tempfile.TemporaryDirectory(prefix="madeira-jit-continuation-") as folder:
+    swift_path = Path(folder) / "main.swift"
+    swift_path.write_text(swift_test)
+    subprocess.run(["swift", str(swift_path)], check=True)
+
 # Packaging: both targets share Codable messages; only the helper links the
 # device-only StikJIT framework; the script and helper are embedded in the app.
 for marker in [
     "MadeiraJITHelper.appex in Embed JIT Helper",
     "madeira-jit.js in Resources",
-    "JITBuiltInMessages.swift in Helper Sources",
+    "B1000011 /* JITBuiltInMessages.swift in Sources */",
     "Frameworks/StikJIT.xcframework/ios-arm64",
 ]:
     require(marker in project, f"Xcode project contains {marker}")
@@ -137,7 +245,7 @@ project = (root / "app/Madeira.xcodeproj/project.pbxproj").read_text()
 helper_source = (root / "app/MadeiraJITHelper/MadeiraJITHelper.swift").read_text()
 require(project.count('PRODUCT_BUNDLE_IDENTIFIER = "$(MADEIRA_BUNDLE_IDENTIFIER)";') == 2
         and project.count('PRODUCT_BUNDLE_IDENTIFIER = "$(MADEIRA_BUNDLE_IDENTIFIER).JITHelper";') == 2
-        and project.count("MADEIRA_BUNDLE_IDENTIFIER = com.willfaust.madeora;") == 2
+        and len(re.findall(r"(?m)^\s*MADEIRA_BUNDLE_IDENTIFIER = [^;]+;", project)) == 2
         and "AppExtensionPoint" not in helper_source,
         "one setting, MADEIRA_BUNDLE_IDENTIFIER, names the app and the helper")
 
@@ -164,14 +272,15 @@ require('URL(string: "localdevvpn://enable?scheme=madeira")' in setup
 # Play without JIT runs Enable JIT, then starts the game, once: only with the debugger
 # attached (so the start cannot ask again), and never after a failure.
 gate = function(content, "private func jitReadyForLaunch(")
-require(gate.index("if StikJITHelper.ready { return true }") < gate.index("if inLibrary, let launch {")
+require(gate.index("if StikJITHelper.ready { return true }") < gate.index("if let launch {")
         < gate.index("if StikJITHelper.flaggedWithoutDebugger {")
         and "launchAfterJIT = launch" in gate and "library.startingJIT = entry" in gate
         and "if jitStatus != .testing { enableJIT() }" in gate,
         "Play without JIT enables it (a second Play while it runs only replaces the game)")
 ended = function(content, "private func launchAfterJITEnded(")
 require("launchAfterJIT = nil" in ended
-        and "guard started, StikJITHelper.ready, library.current == nil, wine_process_is_running() == 0 else {" in ended
+        and "guard started, StikJITHelper.ready, library.current == nil," in ended
+        and "wine_process_is_running() == 0, wineserver_is_running() == 0 else {" in ended
         and ended.index("launchAfterJIT = nil") < ended.index("library.startingJIT = nil") < ended.index("launch()"),
         "the waiting game starts once, only when JIT came on and nothing else started")
 require('if model.startingJIT == entry.id {' in library and 'Text("Starting JIT")' in library and 'ProgressView()' in library
@@ -182,10 +291,15 @@ require('if model.startingJIT == entry.id {' in library and 'Text("Starting JIT"
 enable_jit = function(content, "private func enableJIT()")
 require(enable_jit.count("launchAfterJITEnded(started: false)") == 2 and enable_jit.count("launchAfterJITEnded(started: true)") == 1,
         "every way Enable JIT ends settles the waiting game")
-play = function(content, "private func launchLibraryEntry(")
-require("guard jitReadyForLaunch(inLibrary: true, entry: entry.id, then: { startLibraryEntry(entry) }) else { return }" in play
-        and play.index("cloudClear(") < play.index("jitReadyForLaunch(")
-        and "then: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }" in content,
+play = function(content, "private func launchLibraryEntry(_ entry: LibraryEntry, inspectionOnly: Bool)")
+continuation = function(content, "private func continueLibraryLaunch(")
+dock = function(content, "private func startDock(")
+require("guard jitReadyForLaunch(inLibrary: true, entry: entry.id, preparation: preparation," in continuation
+        and "then: { startLibraryEntry(entry, preparation: preparation, externalContext: externalContext) }) else { return }" in continuation
+        and play.index("cloudClear(") < play.index("continueLibraryLaunch(")
+        and "then: { startDock(game, compactPool: compactPool, profile: profile," in dock
+        and "preparation: preparation, launchOption: launchOption," in dock
+        and "runtimeExecutable: runtimeExecutable, runtimeChecked: true) }) else { return }" in dock,
         "Play and Dock starts continue after JIT without repeating the checks already passed")
 
 print("check-jit-method: PASS")

@@ -39,7 +39,42 @@ enum SteamAuthAPI {
         request.timeoutInterval = 20
         request.cachePolicy = .reloadIgnoringLocalCacheData
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        // A lost poll must not discard its QR session. Only read-only operations
+        // may retry; creating a challenge or submitting credentials/codes is not replayed.
+        let retryable = (method == "PollAuthSessionStatus" && httpMethod == "POST")
+            || (method == "GetPasswordRSAPublicKey" && httpMethod == "GET")
+        let loggedMethod: String
+        switch method {
+        case "PollAuthSessionStatus", "GetPasswordRSAPublicKey", "BeginAuthSessionViaQR",
+             "BeginAuthSessionViaCredentials", "UpdateAuthSessionWithSteamGuardCode",
+             "GenerateAccessTokenForApp": loggedMethod = method
+        default: loggedMethod = "other"
+        }
+        var attempt = 0
+        let data: Data, response: URLResponse
+        while true {
+            try Task.checkCancellation()
+            attempt += 1
+            let started = Date()
+            do {
+                let result = try await URLSession.shared.data(for: request)
+                try Task.checkCancellation()
+                data = result.0; response = result.1
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+                SteamLog.event("[steam-auth] method=\(loggedMethod) host=api.steampowered.com attempt=\(attempt) http=\(status) elapsed-ms=\(elapsed)")
+                break
+            } catch {
+                try Task.checkCancellation()
+                let code = (error as? URLError)?.code
+                let reason = code.map { "url-\($0.rawValue)" } ?? "transport"
+                let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+                SteamLog.event("[steam-auth] method=\(loggedMethod) host=api.steampowered.com attempt=\(attempt) result=\(reason) elapsed-ms=\(elapsed)")
+                guard retryable, attempt < 2,
+                      code == .networkConnectionLost || code == .timedOut || code == .cannotConnectToHost else { throw error }
+                try await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
         guard let http = response as? HTTPURLResponse else {
             throw SteamError.authenticationFailed("Steam did not respond. Check your internet connection.")
         }

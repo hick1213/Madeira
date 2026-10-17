@@ -25,6 +25,7 @@
 
 #include <assert.h>
 #include <pthread.h>
+#include <stdint.h>
 
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -540,6 +541,97 @@ static int winios_game_windows(void)
     return on;
 }
 
+/* DESKTOP_OWNER_BEGIN */
+extern uint64_t winios_control_session_token(void);
+static struct {
+    pthread_mutex_t lock;
+    uint64_t generation;
+    HWND hwnd;
+    DWORD pid, tid;
+    int posted;
+} winios_desktop_owner = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+void winios_drv_reset_desktop_identity(void)
+{
+    pthread_mutex_lock(&winios_desktop_owner.lock);
+    winios_desktop_owner.generation = 0;
+    winios_desktop_owner.hwnd = NULL;
+    winios_desktop_owner.pid = winios_desktop_owner.tid = 0;
+    winios_desktop_owner.posted = 0;
+    pthread_mutex_unlock(&winios_desktop_owner.lock);
+}
+
+/* Only the real desktop's owning Wine thread may register this identity. */
+int winios_drv_desktop_identity(uint64_t generation, uintptr_t *hwnd, unsigned int *pid)
+{
+    const char *mode = getenv("MADEIRA_DESKTOP");
+    HWND desktop;
+    DWORD owner_pid = 0, owner_tid;
+    int valid = 0;
+    if (!hwnd || !pid || !generation || generation != winios_control_session_token() ||
+        !mode || mode[0] != '1') return 0;
+    desktop = get_desktop_window();
+    owner_tid = get_window_thread(desktop, &owner_pid);
+    if (!desktop || !owner_pid || !owner_tid || owner_pid != GetCurrentProcessId() ||
+        owner_tid != GetCurrentThreadId()) return 0;
+    pthread_mutex_lock(&winios_desktop_owner.lock);
+    if (winios_desktop_owner.generation != generation)
+    {
+        winios_desktop_owner.generation = generation;
+        winios_desktop_owner.hwnd = desktop;
+        winios_desktop_owner.pid = owner_pid;
+        winios_desktop_owner.tid = owner_tid;
+        winios_desktop_owner.posted = 0;
+        dprintf(2, "[desktop-control] register generation=%llu hwnd=%p pid=%u tid=%u\n",
+                (unsigned long long)generation, desktop, owner_pid, owner_tid);
+    }
+    if (winios_desktop_owner.hwnd == desktop && winios_desktop_owner.pid == owner_pid &&
+        winios_desktop_owner.tid == owner_tid)
+    {
+        *hwnd = (uintptr_t)desktop; *pid = owner_pid; valid = 1;
+    }
+    pthread_mutex_unlock(&winios_desktop_owner.lock);
+    return valid;
+}
+
+int winios_drv_close_owned_desktop(uint64_t generation, uintptr_t hwnd, unsigned int pid)
+{
+    HWND desktop = (HWND)hwnd;
+    DWORD actual_pid = 0, tid;
+    int result = 0;
+    if (!generation || generation != winios_control_session_token() || !desktop || !pid) return 0;
+    if (get_desktop_window() != desktop) return 0;
+    tid = get_window_thread(desktop, &actual_pid);
+    if (!tid || actual_pid != pid || pid != GetCurrentProcessId() || tid != GetCurrentThreadId()) return 0;
+    pthread_mutex_lock(&winios_desktop_owner.lock);
+    if (winios_desktop_owner.generation == generation && winios_desktop_owner.hwnd == desktop &&
+        winios_desktop_owner.pid == pid && winios_desktop_owner.tid == tid)
+    {
+        if (winios_desktop_owner.posted) result = 1;
+        else if (NtUserPostMessage(desktop, WM_CLOSE, 0, 0))
+        {
+            winios_desktop_owner.posted = 1; result = 1;
+            dprintf(2, "[desktop-control] WM_CLOSE generation=%llu hwnd=%p pid=%u tid=%u\n",
+                    (unsigned long long)generation, desktop, pid, tid);
+        }
+    }
+    pthread_mutex_unlock(&winios_desktop_owner.lock);
+    return result;
+}
+
+static int winios_drv_desktop_needs_poll(void)
+{
+    int active;
+    uint64_t generation = winios_control_session_token();
+    pthread_mutex_lock(&winios_desktop_owner.lock);
+    active = generation && winios_desktop_owner.generation == generation &&
+             winios_desktop_owner.pid == GetCurrentProcessId() &&
+             winios_desktop_owner.tid == GetCurrentThreadId();
+    pthread_mutex_unlock(&winios_desktop_owner.lock);
+    return active;
+}
+/* DESKTOP_OWNER_END */
+
 /* Game mode, a thread that shows a launcher / message box. Taps and keys wait
  * in the app's ring (Winios.m) until a wine thread runs pProcessEvents. A
  * game's own loop polls PeekMessage and drains it every frame, but a modal
@@ -554,7 +646,7 @@ static __thread int winios_thread_shows_dialog;
 
 int winios_input_wake_thread(void)
 {
-    return winios_thread_shows_dialog;
+    return winios_thread_shows_dialog || winios_drv_desktop_needs_poll();
 }
 
 static void winios_note_dialog_thread( HWND hwnd, const RECT *visible )

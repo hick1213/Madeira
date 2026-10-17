@@ -195,6 +195,9 @@ final class GamepadInput: @unchecked Sendable {
     private var hidBattery: (level: UInt8, charging: UInt8) = (UInt8(WINIOS_HIDPAD_BATTERY_UNKNOWN), 0)
     private var hidBatteryCountdown = 0
     private var touchState = TouchGamepadState()
+    private var publicationEnabled = false
+    private var diagnosticIDs: [ObjectIdentifier: UUID] = [:]
+    private var diagnostics = ControllerDiagnosticState()
     @MainActor private var observers: [NSObjectProtocol] = []
     @MainActor private var started = false
 
@@ -203,7 +206,8 @@ final class GamepadInput: @unchecked Sendable {
         started = true
         LogStore.shared.log("[xinput] ml1920 physical controllers enabled=\(Self.enabled ? 1 : 0)")
         LogStore.shared.log("[touch-xinput] ml1930 enabled=\(Self.touchEnabled ? 1 : 0)")
-        guard Self.enabled else { return }
+        let enabled = Self.enabled
+        queue.async { [self] in publicationEnabled = enabled }
         let center = NotificationCenter.default
         for name in [Notification.Name.GCControllerDidConnect, .GCControllerDidDisconnect] {
             observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -227,10 +231,17 @@ final class GamepadInput: @unchecked Sendable {
     @MainActor private func refreshControllers() {
         // Capture the live profile on main. Re-fetching extendedGamepad on the
         // polling queue yielded stale axes on devices tested in the fork.
-        let live = GCController.controllers().compactMap { controller -> (GCController, GCExtendedGamepad)? in
-            guard let profile = controller.extendedGamepad else { return nil }
-            controller.handlerQueue = queue
-            return (controller, profile)
+        let detected = GCController.controllers().map { controller in
+            let profile = controller.extendedGamepad
+            if profile != nil { controller.handlerQueue = queue }
+            return (controller: controller, profile: profile,
+                    name: controller.vendorName ?? controller.productCategory,
+                    category: controller.productCategory,
+                    buttons: profile.map { Self.availableButtons($0) } ?? 0)
+        }
+        let live = detected.compactMap { entry -> (GCController, GCExtendedGamepad)? in
+            guard let profile = entry.profile else { return nil }
+            return (entry.controller, profile)
         }
         queue.async { [self] in
             for i in controllers.indices {
@@ -261,6 +272,16 @@ final class GamepadInput: @unchecked Sendable {
             // ml2106: the pad in each slot is where that slot's rumble plays
             // (and slot 0's the DualSense output); unchanged slots are no-ops.
             for i in controllers.indices { madeira_pad_output_set_slot(Int32(i), controllers[i]) }
+            let identities = Set(detected.map { ObjectIdentifier($0.controller) })
+            diagnosticIDs = diagnosticIDs.filter { identities.contains($0.key) }
+            diagnostics.replaceDevices(detected.map { entry in
+                let identity = ObjectIdentifier(entry.controller)
+                let id = diagnosticIDs[identity] ?? UUID()
+                diagnosticIDs[identity] = id
+                return ControllerDiagnosticDevice(id: id, name: entry.name, category: entry.category,
+                    supported: entry.profile != nil, availableButtons: entry.buttons,
+                    slot: controllers.firstIndex(where: { $0 === entry.controller }))
+            })
             updateTimer()
             sample()
         }
@@ -282,7 +303,7 @@ final class GamepadInput: @unchecked Sendable {
     }
 
     private func updateTimer() {
-        let needed = active && profiles.contains(where: { $0 != nil })
+        let needed = active && (publicationEnabled || diagnostics.owner != nil) && profiles.contains(where: { $0 != nil })
         if !needed { timer?.cancel(); timer = nil; return }
         guard timer == nil else { return }
         let source = DispatchSource.makeTimerSource(queue: queue)
@@ -304,8 +325,16 @@ final class GamepadInput: @unchecked Sendable {
     }
 
     private func sample() {
+        guard publicationEnabled || diagnostics.owner != nil else { return }
         for i in profiles.indices {
             let pad = profiles[i]
+            let raw = active ? pad.map { Self.physicalSample($0) } ?? GamepadSample() : GamepadSample()
+            if diagnostics.owner != nil, let controller = controllers[i], let id = diagnosticIDs[ObjectIdentifier(controller)] {
+                diagnostics.record(id: id, raw: raw)
+            }
+            // A disabled Windows bridge still permits an honest physical-input
+            // test; observing it must never turn translation on.
+            guard publicationEnabled else { continue }
             let touchConnected = i == 0 && touchState.connected
             // Player 1's pad went away mid-press: nothing feeds the driver now, so
             // release the keys and buttons it holds.
@@ -327,22 +356,9 @@ final class GamepadInput: @unchecked Sendable {
             // app is inactive. A delayed callback cannot republish a held key.
             if active, let pad {
                 hidLive = hid ? pad : nil
-                let buttons: [(GCControllerButtonInput?, UInt16)] = [
-                    (pad.dpad.up, 0x0001), (pad.dpad.down, 0x0002),
-                    (pad.dpad.left, 0x0004), (pad.dpad.right, 0x0008),
-                    (pad.buttonMenu, 0x0010), (pad.buttonOptions, 0x0020),
-                    (pad.leftThumbstickButton, 0x0040), (pad.rightThumbstickButton, 0x0080),
-                    (pad.leftShoulder, 0x0100), (pad.rightShoulder, 0x0200),
-                    (pad.buttonHome, 0x0400), (pad.buttonA, 0x1000),
-                    (pad.buttonB, 0x2000), (pad.buttonX, 0x4000), (pad.buttonY, 0x8000)
-                ]
-                for (button, mask) in buttons where button?.isPressed == true { state.buttons |= mask }
-                state.left_trigger = Self.trigger(pad.leftTrigger.value)
-                state.right_trigger = Self.trigger(pad.rightTrigger.value)
-                state.lx = Self.axis(pad.leftThumbstick.xAxis.value)
-                state.ly = Self.axis(pad.leftThumbstick.yAxis.value)
-                state.rx = Self.axis(pad.rightThumbstick.xAxis.value)
-                state.ry = Self.axis(pad.rightThumbstick.yAxis.value)
+                state.buttons = raw.buttons
+                state.left_trigger = raw.lt; state.right_trigger = raw.rt
+                state.lx = raw.lx; state.ly = raw.ly; state.rx = raw.rx; state.ry = raw.ry
                 // The library front end navigates with player 1's pad (Library.swift).
                 // While it owns input (no session, or its menu is open) the game
                 // sees a connected pad at rest.
@@ -392,6 +408,71 @@ final class GamepadInput: @unchecked Sendable {
                 }
             }
             winios_gamepad_set_state(Int32(i), &state)
+        }
+    }
+
+    private static func buttonInputs(_ pad: GCExtendedGamepad) -> [(GCControllerButtonInput?, UInt16)] {
+        [
+            (pad.dpad.up, 0x0001), (pad.dpad.down, 0x0002),
+            (pad.dpad.left, 0x0004), (pad.dpad.right, 0x0008),
+            (pad.buttonMenu, 0x0010), (pad.buttonOptions, 0x0020),
+            (pad.leftThumbstickButton, 0x0040), (pad.rightThumbstickButton, 0x0080),
+            (pad.leftShoulder, 0x0100), (pad.rightShoulder, 0x0200),
+            (pad.buttonHome, 0x0400), (pad.buttonA, 0x1000),
+            (pad.buttonB, 0x2000), (pad.buttonX, 0x4000), (pad.buttonY, 0x8000)
+        ]
+    }
+    private static func availableButtons(_ pad: GCExtendedGamepad) -> UInt16 {
+        buttonInputs(pad).reduce(0) { $0 | ($1.0 == nil ? 0 : $1.1) }
+    }
+    private static func physicalSample(_ pad: GCExtendedGamepad) -> GamepadSample {
+        var value = GamepadSample()
+        for (button, mask) in buttonInputs(pad) where button?.isPressed == true { value.buttons |= mask }
+        value.lt = trigger(pad.leftTrigger.value); value.rt = trigger(pad.rightTrigger.value)
+        value.lx = axis(pad.leftThumbstick.xAxis.value); value.ly = axis(pad.leftThumbstick.yAxis.value)
+        value.rx = axis(pad.rightThumbstick.xAxis.value); value.ry = axis(pad.rightThumbstick.yAxis.value)
+        return value
+    }
+
+    @MainActor func beginControllerTest(_ token: UUID) {
+        start()
+        queue.async { [self] in diagnostics.begin(token); updateTimer(); sample() }
+    }
+    @MainActor func endControllerTest(_ token: UUID) {
+        queue.async { [self] in diagnostics.end(token); updateTimer() }
+    }
+    @MainActor func resetControllerTest(_ token: UUID) {
+        queue.async { [self] in diagnostics.reset(token) }
+    }
+    @MainActor func controllerTestSnapshot(_ token: UUID,
+            completion: @escaping @MainActor @Sendable (ControllerDiagnosticSnapshot) -> Void) {
+        let mode = Self.configuredPadMode().value
+        queue.async { [self] in
+            guard diagnostics.owner == token else { return }
+            var devices = diagnostics.devices
+            for i in devices.indices {
+                devices[i].route = ControllerDiagnosticRoute.resolve(enabled: publicationEnabled,
+                    active: active, device: devices[i], libraryOwns: LibraryController.shared.ownsInput,
+                    keyboardMouse: keyboardMouse != nil, hid: hidActive)
+                guard publicationEnabled, devices[i].connected, let slot = devices[i].slot else { continue }
+                if slot == 0 && hidActive && !hidKeepsXInput {
+                    var state = winios_hidpad()
+                    if winios_hidpad_get_state(&state) != 0 {
+                        devices[i].packet = state.packet
+                        devices[i].transmitted = GamepadSample(buttons: UInt16(truncatingIfNeeded: state.buttons),
+                            lt: state.left_trigger, rt: state.right_trigger, lx: state.lx, ly: state.ly, rx: state.rx, ry: state.ry)
+                    }
+                } else {
+                    var state = winios_gamepad()
+                    if winios_gamepad_get_state(Int32(slot), &state) != 0 {
+                        devices[i].packet = state.packet
+                        devices[i].transmitted = GamepadSample(buttons: state.buttons,
+                            lt: state.left_trigger, rt: state.right_trigger, lx: state.lx, ly: state.ly, rx: state.rx, ry: state.ry)
+                    }
+                }
+            }
+            let value = ControllerDiagnosticSnapshot(devices: devices, enabled: publicationEnabled, active: active, configuredMode: mode)
+            DispatchQueue.main.async { completion(value) }
         }
     }
 

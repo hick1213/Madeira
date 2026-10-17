@@ -1,0 +1,6 @@
+LIBRARY dcomp
+EXPORTS
+    DCompositionCreateDevice
+    DCompositionCreateDevice2
+    DCompositionCreateDevice3
+    DllCanUnloadNow PRIVATE

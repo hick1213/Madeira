@@ -13,6 +13,13 @@
 typedef struct MadeiraRPPairing MadeiraRPPairing;
 typedef void (*MadeiraRPPairingPinCallback)(const char *pin, void *context);
 
+/// Match a Remote Pairing Bonjour TXT identifier/authTag to this paired device's
+/// 16-byte alt_irk. Returns 1 for a match, 0 for invalid input or a different peer.
+/// Non-NULL alt_irk must hold alt_irk_len readable bytes; non-NULL strings must
+/// be readable and NUL-terminated. Invalid UTF-8 is rejected.
+int32_t madeira_rppairing_validate_auth_tag(const uint8_t *alt_irk, size_t alt_irk_len,
+                                          const char *identifier, const char *auth_tag);
+
 /// New host identity and a listener on all IPv4 interfaces. NULL on failure,
 /// with *error set (free with madeira_rppairing_string_free).
 MadeiraRPPairing *madeira_rppairing_new(const char *name, char **error);

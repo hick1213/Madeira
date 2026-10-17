@@ -583,6 +583,9 @@ class SteamSession {
         if response.header.eresult != 1 {
             SteamLog.trace("\(method.rawValue) header eresult=\(response.header.eresult)")
         }
+        guard method.acceptsServiceResult(response.header.eresult) else {
+            throw SteamError.invalidMessage
+        }
         return response.body
     }
 

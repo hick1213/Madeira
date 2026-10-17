@@ -463,6 +463,9 @@ __attribute__((noinline, optnone))
 void jit26_detach(void) {
     __asm__ volatile(
         "mov x16, #0\n"
+        ".globl _jit26_detach_breakpoint\n"
+        ".private_extern _jit26_detach_breakpoint\n"
+        "_jit26_detach_breakpoint:\n"
         "brk #0xf00d\n"
         ::: "x16", "memory"
     );

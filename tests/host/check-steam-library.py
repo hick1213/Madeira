@@ -4,8 +4,8 @@
 # Madeira Converter Exception: see LICENSE-EXCEPTION.md
 """Host checks for the owned Steam library and downloads (docs/STEAM_LIBRARY.md).
 
-Never contacts Steam. It needs swiftc (Linux), cc, python3 with `cryptography`
-or the openssl command, and libssl/liblzma/zlib development files.
+Never contacts Steam. It needs swiftc, cc, Python 3.14 with `cryptography` or the
+openssl command. macOS uses Apple's SDK; Linux needs libssl/liblzma/zlib headers.
 
 Part A is static: licence headers, the Xcode project, no program names, the
 only token path (SteamSignIn's Keychain item), no account data in a log line, no
@@ -23,8 +23,9 @@ scripted Steam connection (`SteamCMSession`), and runs it:
 * units: the message and manifest formats, hostile input, the decrypt and
   decompress pipeline on known vectors, PICS parsing through the fetcher, and
   the install record;
-* installs: the whole download against a local HTTP content server built here
-  (three content-server hosts: one dead, one that corrupts the first answer for
+* installs: the whole download against local HTTP content servers built here;
+  a host-only URLProtocol bridges declared HTTPS fixture origins to those servers
+  and blocks every undeclared origin (three servers: one dead, one that corrupts the first answer for
   each chunk, one healthy; every chunk container Steam serves, AES with the depot
   key, encrypted file names, a shared depot, a depot the account does not own): an
   interrupted install resumes without fetching finished chunks, is not listed as
@@ -51,6 +52,7 @@ import tempfile
 import threading
 import zipfile
 import zlib
+from urllib.parse import urlsplit
 
 root = Path(__file__).resolve().parents[2]
 app = root / 'app/Madeira'
@@ -85,6 +87,7 @@ library_swift = [
     'SwiftSteam/Core/CMServerList.swift', 'SwiftSteam/Core/LicenseListBox.swift', 'SwiftSteam/Core/SteamCMSession.swift',
     'SwiftSteam/Core/SteamConnection.swift', 'SwiftSteam/Core/SteamMessageCodec.swift', 'SwiftSteam/Core/SteamProtocol.swift',
     'SwiftSteam/Core/SteamSession.swift', 'SwiftSteam/Content/ContentDecryptor.swift', 'SwiftSteam/Content/DepotDownloader.swift',
+    'SwiftSteam/Content/SteamDownloadSources.swift',
     'SwiftSteam/Content/DepotManifest.swift', 'SwiftSteam/Library/SteamAppInfo.swift',
     'SwiftSteam/Library/SteamLibraryFetcher.swift', 'SwiftSteam/Install/AppManifestWriter.swift']
 c_files = ['SwiftSteam/chunk_zip.c', 'SwiftSteam/chunk_zip.h', 'SwiftSteam/lzma_shim.c', 'SwiftSteam/lzma_shim.h',
@@ -99,7 +102,8 @@ for path, text in sources.items():
     if 'Jfishin' in head[1]:
         require("Jfishin's Madeira Steam client" in text.split('import ', 1)[0], f'{path} credits Jfishin')
 for path in c_files:
-    require(f'path = "{path}"' in project, f'{path} is in the Xcode project')
+    require(re.search(r'\bpath\s*=\s*(?:"' + re.escape(path) + r'"|' + re.escape(path) + r')\s*;', project),
+            f'{path} is in the Xcode project')
     if path.endswith('.c'):
         require(f'/* {path} in Sources */' in project, f'{path} is built by the Xcode project')
 require('liblzma.tbd in Frameworks' in project, 'liblzma is linked (the system library; nothing is bundled)')
@@ -161,18 +165,20 @@ owned_text = sources['SteamOwnedLibrary.swift']
 require('SteamDownloadBackground.shared.downloadStarted(appID: appID' in owned_text and 'SteamDownloadBackground.shared.progress(progress)' in owned_text
         and 'outcome: outcome, queueEmpty: queue.isEmpty)' in owned_text, 'every download reports its start, progress and outcome')
 content_view = (app / 'ContentView.swift').read_text()
-require(content_view.count('SteamOwnedLibrary.shared.sessionChanged(active: true)') == 1,
-        'a session start pauses downloads and closes the Steam connection (one call, in runWineFullSequence)')
+game_work = (app / 'GameSessionWork.swift').read_text()
+require(game_work.count('SteamOwnedLibrary.shared.sessionChanged(active: paused)') == 1 and
+        'GameSessionWork.shared.reconcile()' in content_view,
+        'the shared session coordinator pauses Steam through its existing session transition (static integration boundary)')
 # Madeira Dock: the app's own connection is logged off (socket closed) before the one-use sign-in
 # is written, and stays off until the Dock session ended (the ordering the gate test above runs).
 dock_start = block(content_view, 'private func startDock(')
 order = [dock_start.find(s) for s in ('await SteamOwnedLibrary.shared.prepareDock()', 'SteamSignIn.credentialsForDock()',
-                                      'try MadeiraDock.writeHandoff(', 'runWineFullSequence(profile: profile)')]
+                                      'try MadeiraDock.writeHandoff(', 'runWineFullSequence(profile: profile, preparation: preparation)')]
 require(-1 not in order and order == sorted(order),
         'Dock start: the app connection closes, then the sign-in is read and handed over, then the session starts')
 require(dock_start.count('SteamSignIn.credentialsForDock()') == 1 and dock_start.count('MadeiraDock.writeHandoff(') == 1,
         'the sign-in is read and written once, after the connection closed')
-require('SteamOwnedLibrary.shared.dockEnded()' in dock_start[:dock_start.index('Task { @MainActor in')],
+require('SteamOwnedLibrary.shared.dockEnded()' in block(dock_start, 'func fail('),
         'a failed Dock start gives the connection back')
 dock_view = (app / 'MadeiraDockView.swift').read_text()
 watch = block(dock_view, 'func watchReport()')
@@ -183,7 +189,7 @@ prepare = block(owned_model, 'func prepareDock() async')
 require(prepare.index('sessionChanged(active: true)') < prepare.index('await running?.value') < prepare.index('await gate.holdForDock()'),
         'prepareDock pauses downloads, waits for the running one, then waits for the connection to close')
 changed = block(owned_model, 'func sessionChanged(active running: Bool)')
-require('guard gate.reopen(sessionRunning: false) else { return }' in changed and 'gate.close()' in changed
+require('guard gate.open || gate.reopen(sessionRunning: false) else { return }' in changed and 'gate.close()' in changed
         and 'session.resume()' not in changed and 'session.suspend()' not in changed,
         'a session ending reopens the connection only through the gate (never while Dock holds the account)')
 session_source = sources['SwiftSteam/Core/SteamSession.swift']
@@ -218,7 +224,7 @@ try:
         return e.update(data) + e.finalize()
 except ImportError:
     def _openssl(args, data):
-        return subprocess.run(['openssl', 'enc'] + args, input=data, capture_output=True, check=True).stdout
+        return subprocess.run(['openssl', 'enc'] + args, input=data, capture_output=True, check=True, timeout=30).stdout
     def aes_ecb(key, data, decrypt=False):
         return _openssl(['-aes-256-ecb', '-nopad', '-K', key.hex()] + (['-d'] if decrypt else []), data)
     def aes_cbc_encrypt(key, iv, data):
@@ -380,6 +386,10 @@ class ContentServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     def url(self):
         return f'http://127.0.0.1:{self.server_address[1]}'
 
+    @property
+    def secure_url(self):
+        return f'https://{self.mode}.fixture.steamcontent.com'
+
 
 class State:
     def __init__(self):
@@ -392,11 +402,15 @@ class State:
         self.served_ok = []       # (host mode, sha hex)
         self.chunk_requests = []  # sha hex, every request
         self.manifest_requests = []
+        self.chunk_origins = []   # (declared original origin, sha), including failed probes
+        self.extra_origins = {}   # declared production origins mapped to this fixture's loopback servers
+        self.chunk_refusals = []  # regional HTTP nodes that deliberately refuse chunks
         self.denied = 0
 
     def reset_counters(self):
         with self.lock:
-            self.served_ok, self.chunk_requests, self.manifest_requests, self.denied = [], [], [], 0
+            self.served_ok, self.chunk_requests, self.manifest_requests, self.chunk_origins, self.denied = [], [], [], [], 0
+            self.chunk_refusals = []
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -410,30 +424,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
         server, state = self.server, self.server.state
         path, _, query = self.path.partition('?')
         parts = path.strip('/').split('/')
-        if server.mode == 'dead':
-            return self.reply(503)
-        if query != f'auth={state.auth}':
-            with state.lock: state.denied += 1
-            return self.reply(403)
         try:
             depot = int(parts[1])
+            origin = self.headers.get('X-Madeira-Fixture-Origin', '')
+            allowed = origin in (server.url, server.secure_url) or state.extra_origins.get(origin) == server.url
+            secure = allowed and origin.startswith('https://')
+            token = f'{state.auth}-{urlsplit(origin).hostname}-{depot}'
+            if not allowed or (secure and query != f'auth={token}') or (not secure and query):
+                with state.lock: state.denied += 1
+                return self.reply(403)
             if parts[2] == 'manifest':
+                if not secure:
+                    with state.lock: state.denied += 1
+                    return self.reply(403)
                 gid, code = int(parts[3]), parts[5] if len(parts) > 5 else ''
-                with state.lock: state.manifest_requests.append((depot, gid))
+                with state.lock: state.manifest_requests.append((origin, depot, gid))
                 if parts[4] != '5' or code != str(state.request_code) or (depot, gid) not in state.manifests:
                     return self.reply(404)
+                if server.mode == 'dead': return self.reply(503)
                 return self.reply(200, state.manifests[(depot, gid)])
             if parts[2] == 'chunk':
                 sha = parts[3]
                 with state.lock:
                     state.chunk_requests.append(sha)
+                    state.chunk_origins.append((origin, sha))
+                    if server.mode == 'dead': return self.reply(503)
+                    if server.mode == 'forbidden':
+                        state.chunk_refusals.append((origin, sha))
+                        return self.reply(403)
                     if state.limit is not None and len(state.served_ok) >= state.limit:
                         return self.reply(404)
                 blob = state.depots[depot].chunks.get(sha)
                 if blob is None:
                     return self.reply(404)
-                if server.mode == 'flaky' and sha not in server.corrupted:
-                    server.corrupted.add(sha)
+                if server.mode == 'flaky' and (origin, sha) not in server.corrupted:
+                    server.corrupted.add((origin, sha))
                     blob = blob[:40] + bytes([blob[40] ^ 0xff]) + blob[41:]
                     return self.reply(200, blob)
                 with state.lock: state.served_ok.append((server.mode, sha))
@@ -519,7 +544,19 @@ import Foundation
 import FoundationNetworking
 #endif
 
-nonisolated(unsafe) var loggedEvents: [String] = []
+final class FixtureEventLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [String] = []
+    func append(_ event: String) {
+        lock.lock(); defer { lock.unlock() }
+        events.append(event)
+    }
+    func joined(separator: String) -> String {
+        lock.lock(); defer { lock.unlock() }
+        return events.joined(separator: separator)
+    }
+}
+let loggedEvents = FixtureEventLog()
 enum SteamLog {
     static func trace(_ m: @autoclosure () -> String) {}
     static func event(_ m: String) { loggedEvents.append(m) }
@@ -555,6 +592,94 @@ func hexData(_ s: String) -> Data {
 }
 func le(_ v: UInt32) -> [UInt8] { [UInt8(v & 0xff), UInt8(v >> 8 & 0xff), UInt8(v >> 16 & 0xff), UInt8(v >> 24)] }
 
+/// Only the transport is doubled: production URL construction, authorization,
+/// manifest decoding and encrypted chunk validation run without substitutions.
+/// Every URL in the downloader's two sessions is intercepted, including live
+/// fallback origins, which fail closed before DNS or a socket can be opened.
+final class FixtureContentProtocol: URLProtocol {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var origins: [String: String] = [:]
+    nonisolated(unsafe) private static var blocked = 0
+    nonisolated(unsafe) private static var sawChecking = false
+    nonisolated(unsafe) private static var currentPhase = "preparing"
+    nonisolated(unsafe) private static var chunksBeforeChecking = 0
+    nonisolated(unsafe) private static var chunksOutsideDownloading = 0
+    nonisolated(unsafe) static var directoryCacheURL = URL(fileURLWithPath: "/unused-fixture-directory-cache")
+    private var fixtureTask: URLSessionDataTask?
+    private var bridge: URLSession?
+
+    static func configure(_ mapping: [String: String], cacheURL: URL) {
+        lock.lock(); defer { lock.unlock() }
+        origins = mapping; blocked = 0
+        sawChecking = false; currentPhase = "preparing"
+        chunksBeforeChecking = 0; chunksOutsideDownloading = 0
+        directoryCacheURL = cacheURL
+    }
+    static func progressPhase(_ phase: String) {
+        lock.lock(); defer { lock.unlock() }
+        currentPhase = phase
+        if phase == "checking" { sawChecking = true }
+    }
+    static var prematureChunkCount: Int { lock.lock(); defer { lock.unlock() }; return chunksBeforeChecking }
+    static var wrongPhaseChunkCount: Int { lock.lock(); defer { lock.unlock() }; return chunksOutsideDownloading }
+    private static func target(_ url: URL) -> (String, URL)? {
+        lock.lock(); defer { lock.unlock() }
+        guard var parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              parts.user == nil, parts.password == nil, parts.fragment == nil else { blocked += 1; return nil }
+        parts.path = ""; parts.query = nil
+        guard let origin = parts.string, let local = origins[origin],
+              let base = URLComponents(string: local), base.scheme == "http", base.host == "127.0.0.1",
+              let port = base.port, port > 0 else { blocked += 1; return nil }
+        var routed = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+        routed.scheme = base.scheme; routed.host = base.host; routed.port = port
+        guard let target = routed.url else { blocked += 1; return nil }
+        return (origin, target)
+    }
+    static var blockedCount: Int { lock.lock(); defer { lock.unlock() }; return blocked }
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        guard let original = request.url, let (origin, local) = Self.target(original) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL)); return
+        }
+        if original.path.contains("/chunk/") {
+            Self.lock.lock()
+            if !Self.sawChecking { Self.chunksBeforeChecking += 1 }
+            if Self.currentPhase != "downloading" { Self.chunksOutsideDownloading += 1 }
+            Self.lock.unlock()
+        }
+        var forwarded = request
+        forwarded.url = local
+        forwarded.setValue(origin, forHTTPHeaderField: "X-Madeira-Fixture-Origin")
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [] // only the validated loopback bridge reaches native transport
+        configuration.connectionProxyDictionary = [:]
+        configuration.urlCache = nil
+        configuration.urlCredentialStorage = nil
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.timeoutIntervalForRequest = 5
+        configuration.timeoutIntervalForResource = 10
+        let session = URLSession(configuration: configuration, delegate: ContentRedirectPolicy(), delegateQueue: nil)
+        bridge = session
+        fixtureTask = session.dataTask(with: forwarded) { [weak self] data, response, error in
+            guard let self else { return }
+            defer { session.finishTasksAndInvalidate() }
+            if let error { self.client?.urlProtocol(self, didFailWithError: error); return }
+            guard let response = response as? HTTPURLResponse,
+                  let originalResponse = HTTPURLResponse(url: original, statusCode: response.statusCode,
+                    httpVersion: "HTTP/1.0", headerFields: response.allHeaderFields.reduce(into: [String: String]()) {
+                        $0[String(describing: $1.key)] = String(describing: $1.value)
+                    }) else { self.client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse)); return }
+            self.client?.urlProtocol(self, didReceive: originalResponse, cacheStoragePolicy: .notAllowed)
+            if let data { self.client?.urlProtocol(self, didLoad: data) }
+            self.client?.urlProtocolDidFinishLoading(self)
+        }
+        fixtureTask?.resume()
+    }
+    override func stopLoading() { fixtureTask?.cancel(); bridge?.invalidateAndCancel() }
+}
+
 /// A logged-on connection whose answers are scripted from the fixture.
 @MainActor final class ScriptedSession: SteamCMSession {
     var cellID: UInt32 = 7
@@ -570,6 +695,8 @@ func le(_ v: UInt32) -> [UInt8] { [UInt8(v & 0xff), UInt8(v >> 8 & 0xff), UInt8(
     var codeRequests: [(app: UInt32, depot: UInt32, gid: UInt64)] = []
     var authRequests: [(depot: UInt32, host: String, app: UInt32)] = []
     var picsAppRequests: [[UInt32]] = []
+    var directoryHosts: [String]?
+    var directoryRequests: [(cell: UInt32, ip: String?)] = []
     var connects = 0
 
     func ensureConnected() async throws { connects += 1 }
@@ -639,6 +766,26 @@ func le(_ v: UInt32) -> [UInt8] { [UInt8(v & 0xff), UInt8(v >> 8 & 0xff), UInt8(
     func callServiceMethod(method: SteamServiceMethod, body: Data, timeout: TimeInterval) async throws -> Data {
         var d = ProtobufDecoder(body); var out = ProtobufEncoder()
         switch method {
+        case .getContentServers:
+            guard let directoryHosts else { throw SteamError.invalidMessage }
+            var cell: UInt32 = 0, ip: String?, maximum: UInt32 = 0
+            while let tag = try d.readTag() {
+                if tag.fieldNumber == 1 { cell = UInt32(truncatingIfNeeded: try d.readVarint()) }
+                else if tag.fieldNumber == 2 { maximum = UInt32(truncatingIfNeeded: try d.readVarint()) }
+                else if tag.fieldNumber == 3 { ip = try d.readString() }
+                else { try d.skip(wireType: tag.wireType) }
+            }
+            require(maximum == 100, "the production CM directory request asks for the complete bounded recommendation")
+            directoryRequests.append((cell, ip))
+            for host in directoryHosts {
+                var row = ProtobufEncoder()
+                row.writeString(fieldNumber: 1, value: "CDN")
+                row.writeUInt32(fieldNumber: 3, value: cell)
+                row.writeString(fieldNumber: 8, value: host)
+                row.writeString(fieldNumber: 9, value: host)
+                row.writeString(fieldNumber: 12, value: "unavailable")
+                out.writeSubmessage(fieldNumber: 1, value: row.data)
+            }
         case .getManifestRequestCode:
             var app: UInt32 = 0, depot: UInt32 = 0, gid: UInt64 = 0
             while let tag = try d.readTag() {
@@ -659,7 +806,7 @@ func le(_ v: UInt32) -> [UInt8] { [UInt8(v & 0xff), UInt8(v >> 8 & 0xff), UInt8(
                 else { try d.skip(wireType: tag.wireType) }
             }
             authRequests.append((depot, host, app))
-            out.writeString(fieldNumber: 1, value: authToken)
+            out.writeString(fieldNumber: 1, value: "\(authToken)-\(host)-\(depot)")
         default: throw SteamError.invalidMessage
         }
         return out.data
@@ -677,6 +824,18 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
 }
 
 @MainActor func units(_ fx: [String: Any]) async throws {
+    // An accidental bundled fallback or undeclared loopback origin cannot escape
+    // the transport boundary. These synthetic URLs never reach DNS or a socket.
+    let transportConfiguration = URLSessionConfiguration.ephemeral
+    transportConfiguration.protocolClasses = [FixtureContentProtocol.self]
+    let transportSession = URLSession(configuration: transportConfiguration)
+    defer { transportSession.invalidateAndCancel() }
+    for url in ["https://undeclared.invalid/depot/9001/manifest/1/5/424242", "http://127.0.0.1:1/depot/9001/chunk/" + String(repeating: "0", count: 40)] {
+        do { _ = try await transportSession.data(from: URL(string: url)!); require(false, "undeclared fixture origin is blocked") }
+        catch { require((error as? URLError)?.code == .unsupportedURL, "undeclared fixture origin is blocked before native transport") }
+    }
+    require(FixtureContentProtocol.blockedCount == 2, "both undeclared secure and HTTP origins were intercepted")
+
     // ---- protobuf: hostile input throws instead of trapping
     var big = ProtobufDecoder(Data([0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]))
     _ = try? big.readTag()
@@ -834,7 +993,10 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
         var wrong = key; wrong[0] ^= 1
         do { let o = try ContentDecryptor.processChunk(encryptedData: encrypted, depotKey: wrong, expectedCRC: ContentDecryptor.adler32(plainVector), expectedSize: plainVector.count); require(o != plainVector, "\(kind): a wrong key does not decode") }
         catch { require(error is SteamError, "\(kind): a wrong key is rejected") }
-        var cut = encrypted; cut.removeLast(40)
+        // Cut into the actual payload. Removing only the last 40 bytes of a
+        // ZIP can remove its optional central directory while leaving the
+        // complete local entry/deflate stream that Steam's chunk reader uses.
+        var cut = encrypted; cut.removeLast(max(40, encrypted.count / 2))
         do { let o = try ContentDecryptor.processChunk(encryptedData: cut, depotKey: key, expectedCRC: 0, expectedSize: plainVector.count); require(o != plainVector, "\(kind): a truncated chunk does not decode") }
         catch { require(error is SteamError, "\(kind): a truncated chunk is rejected") }
     }
@@ -870,8 +1032,11 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
             SteamInstallFiles.safeFolderName("a\\b\\Last") == "Last" && SteamInstallFiles.safeFolderName("..") == "app" && SteamInstallFiles.safeFolderName("") == "app" &&
             SteamInstallFiles.safeFolderName("c:") == "app", "install folders are one safe component")
     require(DepotDownloader.usableContentHost("cache1.steamcontent.com") && DepotDownloader.usableContentHost("a.b.akamaized.net") &&
+            DepotDownloader.usableContentHost("steamcdn-a.akamaihd.net") &&
             !DepotDownloader.usableContentHost("evil.example.com") && !DepotDownloader.usableContentHost("x.steamcontent.com:8080") &&
-            !DepotDownloader.usableContentHost("a b.steamcontent.com") && !DepotDownloader.usableContentHost("lancache.steamcontent.com"), "content hosts are Valve's, on the standard port")
+            !DepotDownloader.usableContentHost("a b.steamcontent.com") && !DepotDownloader.usableContentHost("cache1.steamcontent.com/../") &&
+            !DepotDownloader.usableContentHost("127.0.0.1") && !DepotDownloader.usableContentHost("localhost") &&
+            !DepotDownloader.usableContentHost("cdn.local"), "content host syntax admits public CDN vendors and rejects paths, ports, IPs and local names")
     let server: [String: Any] = ["https_support": "unavailable"]
     require(DepotDownloader.serverEligibility(server, appID: 1) == .noHTTPS &&
             DepotDownloader.serverEligibility(["use_as_proxy": true], appID: 1) == .other &&
@@ -907,6 +1072,7 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
     session.keys = [9001: hexData(fx["key"] as! String), 9003: hexData(fx["keyShared"] as! String)]
     session.requestCode = UInt64(fx["requestCode"] as! Int)
     session.authToken = fx["auth"] as! String
+    if phase == "directory-fallback" { session.directoryHosts = fx["directoryHosts"] as? [String] }
     session.licenses = [21]
     session.packageBuffers = [21: packageBuffer(apps: [9000, 9100], depots: [9001, 9003])]
     let version = phase == "update" ? 2 : 1
@@ -928,12 +1094,22 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
     guard let app = try await fetcher.fetchInstallInfo(appID: 9000) else { require(false, "app info"); return }
     require(app.depots.first { $0.depotID == 9003 }?.publicManifestID == UInt64(gidShared), "the shared depot got its manifest from the owning app")
     require(app.sharedOwners[9100]?.installDir == "Fixture Game", "the owner of the shared depot is known for the record")
-    let downloader = DepotDownloader(session: session)
-    downloader.contentHosts = { _ in hosts }
+    let sourceSuite = "madeira-install-sources-" + UUID().uuidString
+    let sourceDefaults = UserDefaults(suiteName: sourceSuite)!
+    defer { sourceDefaults.removePersistentDomain(forName: sourceSuite) }
+    let sourceStore = SteamContentSourceStore(defaults: sourceDefaults)
+    require(sourceStore.select("missing.steamcontent.com"), "a trusted former manual choice is saved")
+    let downloader = DepotDownloader(session: session, sourceStore: sourceStore)
+    if phase != "directory-fallback" { downloader.contentHosts = { _ in hosts } }
     var lastProgress = SteamDownloadProgress()
+    var progressEvents: [SteamDownloadProgress] = []
     let licensed: Set<UInt32> = phase == "refused-licensed" ? [9001, 9003, 9004] : [9001, 9003]
     do {
-        _ = try await downloader.install(app, steamApps: steamApps, ownedDepots: { licensed }) { lastProgress = $0 }
+        _ = try await downloader.install(app, steamApps: steamApps, ownedDepots: { licensed }) {
+            lastProgress = $0
+            progressEvents.append($0)
+            FixtureContentProtocol.progressPhase($0.phase.rawValue)
+        }
         print("RESULT install=ok")
     } catch {
         print("RESULT install=failed reason=\(SteamOwnedLibrary.reason(error))")
@@ -941,13 +1117,47 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
         if phase == "refused-licensed" { require(error as? SteamError == .depotKeyNotFound(9004), "a refusal for a depot the account is licensed for fails the install") }
     }
     let found = MadeiraDock.games(drive: drive)
+    if phase != "refused-licensed" {
+        require(progressEvents.contains { $0.phase.rawValue == "checking" },
+                "the install reports local checking before transferring game chunks")
+        require(FixtureContentProtocol.prematureChunkCount == 0 && FixtureContentProtocol.wrongPhaseChunkCount == 0,
+                "all actual chunk requests, including CDN probes, follow local checking in the downloading phase")
+    }
+    if phase == "recheck" {
+        require(!progressEvents.contains { $0.phase == .downloading },
+                "an unchanged completed install never reports another game download")
+        require(progressEvents.allSatisfy { $0.bytesPerSecond == 0 },
+                "reused local chunks never appear as network speed")
+        require(lastProgress.reusedBytes == lastProgress.totalBytes && lastProgress.networkBytes == 0,
+                "an unchanged completed install accounts for all bytes as reuse and none as network")
+        require(progressEvents.contains { $0.phase.rawValue == "checking" && $0.totalBytes > 0 && $0.doneBytes == $0.totalBytes },
+                "local checking accounts for every verified byte before finishing an unchanged install")
+    }
+    require(lastProgress.sourceNotice?.contains("missing.steamcontent.com") == true,
+            "the full install reports automatic fallback for a missing manual source")
+    require(session.authRequests.allSatisfy { $0.host != "missing.steamcontent.com" },
+            "a stale manual host never receives a depot authorization request")
+    if phase == "directory-fallback" {
+        require(session.directoryRequests.count == 2 && session.directoryRequests[0].cell == session.cellID &&
+                session.directoryRequests[0].ip == nil && session.directoryRequests[1].cell == 0 &&
+                session.directoryRequests[1].ip == "114.114.114.114",
+                "the real directory path queries both the session cell and mainland supplement through production CM messages")
+    }
     print("RESULT listed=\(found.filter { $0.id == 9000 && $0.installed }.count)")
     if phase != "interrupt" && phase != "refused-licensed" {
         require(lastProgress.phase == .finishing && lastProgress.doneBytes == lastProgress.totalBytes && lastProgress.totalBytes > 0, "progress ends complete: \(lastProgress.doneBytes)/\(lastProgress.totalBytes)")
+        require(lastProgress.reusedBytes + lastProgress.networkBytes == lastProgress.totalBytes,
+                "verified reuse and actual fetched chunks account for the entire install without double counting")
+        if let firstDownload = progressEvents.first(where: { $0.phase == .downloading }) {
+            require(firstDownload.networkBytes == 0 && firstDownload.doneBytes == firstDownload.reusedBytes,
+                    "the downloading phase begins with the fully checked local reuse, before any transfer")
+        }
         // Keys are asked for with the app being installed; manifest codes and tokens with the app that owns the content.
         require(session.keyRequests.contains { $0.depot == 9001 && $0.app == 9000 } && session.keyRequests.contains { $0.depot == 9003 && $0.app == 9000 }, "depot keys are requested for the installed app")
         require(session.codeRequests.contains { $0.depot == 9003 && $0.app == 9100 } && session.codeRequests.contains { $0.depot == 9001 && $0.app == 9000 }, "manifest codes are requested for the app that owns the depot")
-        require(session.authRequests.contains { $0.depot == 9003 && $0.app == 9100 && $0.host == "127.0.0.1" }, "content authorization names the bare host name")
+        let secureHostnames = Set((fx["authorizedSecureHosts"] as? [String]) ?? ["dead.fixture.steamcontent.com", "flaky.fixture.steamcontent.com", "good.fixture.steamcontent.com"])
+        require(session.authRequests.contains { $0.depot == 9003 && $0.app == 9100 && secureHostnames.contains($0.host) }, "content authorization names the bare secure host and owning app")
+        require(session.authRequests.allSatisfy { secureHostnames.contains($0.host) }, "credential-free HTTP chunk origins never receive CDN token requests")
         require(!session.keyRequests.contains { $0.depot == 9002 }, "a depot for another language is never asked for")
         guard let game = found.first(where: { $0.id == 9000 }) else { require(false, "Madeira Dock's discovery finds the downloaded game"); return }
         require(game.installed && game.installDir == "Fixture Game" && game.library == "Program Files (x86)/Steam/steamapps" && game.name == "Fixture Game",
@@ -963,6 +1173,12 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
         require(events.contains("[steam-depot] license app=9000 skipped=9004"), "a depot the account neither has a key for nor a license for is left out")
     }
     if phase == "update" {
+        let expectedNetwork = UInt64(fx["updateNetworkBytes"] as! Int)
+        require(lastProgress.networkBytes == expectedNetwork &&
+                lastProgress.reusedBytes == lastProgress.totalBytes - expectedNetwork,
+                "an update counts only its changed chunk as network and all other depots as verified reuse")
+        require(progressEvents.first(where: { $0.phase == .downloading })?.reusedBytes == lastProgress.reusedBytes,
+                "an update checks unchanged chunks in every depot before fetching its first missing chunk")
         require(SteamInstallFiles.buildID(appID: 9000, steamApps: steamApps) == 1001, "the update changed the recorded build")
         require(SteamInstallFiles.buildID(appID: 4242, steamApps: steamApps) == nil, "no record, no build")
         let ownedNow = SteamOwnedGame(app)
@@ -982,11 +1198,14 @@ func packageBuffer(apps: [UInt32], depots: [UInt32]) -> Data {
         let args = CommandLine.arguments
         guard args.count >= 3, let raw = FileManager.default.contents(atPath: args[2]),
               let fx = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else { print("FAIL: fixture"); exit(2) }
+        guard let origins = fx["transportOrigins"] as? [String: String] else { print("FAIL: fixture transport origins"); exit(2) }
+        FixtureContentProtocol.configure(origins, cacheURL: URL(fileURLWithPath: fx["tmp"] as! String).appendingPathComponent("directory-cache.json"))
         do {
             if args[1] == "units" { try await units(fx) } else { try await install(fx, phase: args[1]) }
         } catch {
             print("FAIL: \(args[1]) threw \(error)"); failures += 1
         }
+        require(FixtureContentProtocol.blockedCount == (args[1] == "units" ? 2 : 0), "the complete production harness requested only declared local fixture origins")
         if failures > 0 { print("FAILURES: \(failures)"); exit(1) }
         print("PASS: \(args[1]) phase")
     }
@@ -1001,10 +1220,27 @@ owned_game = owned_source[owned_source.index('struct SteamOwnedGame:'):owned_sou
 playtime_source = owned_source[owned_source.index('// MARK: - Playtime'):owned_source.index('// MARK: - Model')]
 reason = block(owned_source, 'static func reason(_ error: Error) -> String')
 dock_head = dock[dock.index('enum DockPerformancePolicy {'):dock.index('enum MadeiraDock {')]
-dock_body = (dock[dock.index('enum MadeiraDock {'):dock.index('    @MainActor private static var lastReport =')] +
+dock_body = (dock[dock.index('enum MadeiraDock {'):dock.index('    @MainActor static func beginReportSession(')] +
              dock[dock.index("    /// The host's environment for one launch."):])
 # URLSession lives in FoundationNetworking on Linux; the production file imports Foundation only.
 downloader_host = downloader.replace('import Foundation\n', 'import Foundation\n#if canImport(FoundationNetworking)\nimport FoundationNetworking\n#endif\n', 1)
+# Install a fail-closed fixture transport in both normal and probe sessions.
+# This preserves the entire production fetchManifest and download implementations.
+assert downloader_host.count('let config = URLSessionConfiguration.ephemeral') == 2
+downloader_host = downloader_host.replace('let config = URLSessionConfiguration.ephemeral',
+    'let config = URLSessionConfiguration.ephemeral\n        config.protocolClasses = [FixtureContentProtocol.self]')
+# The actual directory pipeline also stays behind the fixture transport. Its
+# persistent cache is redirected only in the generated host copy, preserving all
+# production authority/fallback logic while leaving the user's cache untouched.
+directory_host = sources['SwiftSteam/Content/SteamDownloadSources.swift']
+assert directory_host.count('let config = URLSessionConfiguration.ephemeral') == 1
+directory_host = directory_host.replace('let config = URLSessionConfiguration.ephemeral',
+    'let config = URLSessionConfiguration.ephemeral\n        config.protocolClasses = [FixtureContentProtocol.self]')
+directory_cache = ('static let shared = Cache(fileURL: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]\n'
+                   '            .appendingPathComponent("Madeira/SteamContentDirectory/last-good.json"))')
+assert directory_cache in directory_host
+directory_host = directory_host.replace(directory_cache,
+    'static let shared = Cache(fileURL: FixtureContentProtocol.directoryCacheURL)')
 # The free-space query is Darwin's (volumeAvailableCapacityForImportantUsage); the host has none, so the check is skipped there.
 space = ('let values = try? installURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])\n'
          '            let available = UInt64(max(0, values?.volumeAvailableCapacityForImportantUsage ?? Int64.max))')
@@ -1016,26 +1252,30 @@ work = Path(tempfile.mkdtemp(prefix='madeira-steam-library-'))
 servers = []
 try:
     shim = work / 'shim'
-    for name, header, csource in [('CommonCrypto', CRYPTO_H, CRYPTO_C), ('Compression', COMPRESSION_H, COMPRESSION_C)]:
+    native_apple = sys.platform == 'darwin'
+    shims = [] if native_apple else [('CommonCrypto', CRYPTO_H, CRYPTO_C), ('Compression', COMPRESSION_H, COMPRESSION_C)]
+    for name, header, csource in shims:
         directory = shim / name
         directory.mkdir(parents=True)
         stem = 'cc_shim' if name == 'CommonCrypto' else 'compression_shim'
         (directory / f'{stem}.h').write_text(header)
         (directory / f'{stem}.c').write_text(csource)
         (directory / 'module.modulemap').write_text(f'module {name} [system] {{ header "{stem}.h" export * }}\n')
-    (shim / 'zlib').mkdir()
-    (shim / 'zlib/module.modulemap').write_text('module zlib [system] { header "/usr/include/zlib.h" link "z" export * }\n')
+    if not native_apple:
+        (shim / 'zlib').mkdir()
+        (shim / 'zlib/module.modulemap').write_text('module zlib [system] { header "/usr/include/zlib.h" link "z" export * }\n')
     (work / 'decoders.h').write_text(DECODERS_H.format(app=app))
 
     objects = []
     def compile_c(source, extra=()):
         obj = work / (Path(source).stem + '.o')
-        result = subprocess.run([CC, '-c', '-g', '-fsanitize=address', '-w', str(source), '-o', str(obj)] + list(extra), capture_output=True, text=True)
+        result = subprocess.run([CC, '-c', '-g', '-fsanitize=address', '-w', str(source), '-o', str(obj)] + list(extra), capture_output=True, text=True, timeout=120)
         require(result.returncode == 0, f'{Path(source).name} compiles on the host')
         if result.returncode: sys.stdout.write(result.stderr[-3000:])
         objects.append(str(obj))
-    compile_c(shim / 'CommonCrypto/cc_shim.c', ['-I', str(shim / 'CommonCrypto')])
-    compile_c(shim / 'Compression/compression_shim.c', ['-I', str(shim / 'Compression')])
+    if not native_apple:
+        compile_c(shim / 'CommonCrypto/cc_shim.c', ['-I', str(shim / 'CommonCrypto')])
+        compile_c(shim / 'Compression/compression_shim.c', ['-I', str(shim / 'Compression')])
     for name in ['zstd_edu.c', 'lzma_shim.c', 'chunk_zip.c']:
         compile_c(steam / name)
 
@@ -1048,18 +1288,21 @@ try:
         'var status = Status.satisfied }; var currentPath = Path(); func start(queue: DispatchQueue) {} }\n#endif\n') + dock_head + dock_body)
     (work / 'owned.swift').write_text('import Foundation\n' + owned_game + playtime_source)
     (work / 'downloader.swift').write_text(downloader_host)
+    (work / 'directory.swift').write_text(directory_host)
     production = [steam / 'Proto/SteamProtoMessages.swift', steam / 'Core/SteamError.swift', steam / 'Core/SteamProtocol.swift',
                   steam / 'Core/SteamMessageCodec.swift', steam / 'Core/SteamCMSession.swift',
                   steam / 'Content/ContentDecryptor.swift', steam / 'Content/DepotManifest.swift',
                   steam / 'Library/SteamAppInfo.swift', steam / 'Library/SteamLibraryFetcher.swift',
                   steam / 'Install/AppManifestWriter.swift', app / 'SteamInstall.swift', app / 'SteamKeyValues.swift']
     exe = work / 'check'
-    build = subprocess.run([SWIFTC, '-parse-as-library', '-swift-version', '5', '-sanitize=address', '-g', '-o', str(exe),
-                            '-I', str(shim / 'CommonCrypto'), '-I', str(shim / 'Compression'), '-I', str(shim / 'zlib'),
+    module_flags = [] if native_apple else ['-I', str(shim / 'CommonCrypto'), '-I', str(shim / 'Compression'), '-I', str(shim / 'zlib')]
+    crypto_flags = [] if native_apple else ['-Xlinker', '-lcrypto']
+    build = subprocess.run([SWIFTC, '-j1', '-parse-as-library', '-swift-version', '5', '-sanitize=address', '-g', '-o', str(exe),
+                            *module_flags,
                             '-import-objc-header', str(work / 'decoders.h'),
                             str(work / 'stubs.swift'), str(work / 'checks.swift'), str(work / 'dock.swift'), str(work / 'owned.swift'),
-                            str(work / 'downloader.swift')] + [str(x) for x in production] + objects +
-                           ['-Xlinker', '-lcrypto', '-Xlinker', '-llzma', '-Xlinker', '-lz'], capture_output=True, text=True)
+                            str(work / 'downloader.swift'), str(work / 'directory.swift')] + [str(x) for x in production] + objects + crypto_flags +
+                           ['-Xlinker', '-llzma', '-Xlinker', '-lz'], capture_output=True, text=True, timeout=300)
     require(build.returncode == 0, 'the production Steam library, download and decoder code compile on the host')
     if build.returncode:
         sys.stdout.write(build.stderr[-6000:])
@@ -1086,7 +1329,7 @@ try:
         output[phase] = results
         return results
 
-    # ---- the content network, as a local HTTP server
+    # ---- all transport ends at loopback; HTTPS exists only as a declared fixture origin
     state = State()
     version1, version2, shared = main_depot(1), main_depot(2), shared_depot()
     class Merged: pass
@@ -1101,8 +1344,16 @@ try:
     servers = [dead, flaky, good]
     for server in servers: serve(server)
     fixture = dict(key=KEY_MAIN.hex(), keyShared=KEY_SHARED.hex(), vectorPlain=VEC_PLAIN.hex(), vectors=VEC, rawEncrypted=RAW,
-                   hosts=[dead.url, flaky.url, good.url], requestCode=state.request_code, auth=state.auth,
+                   hosts=[server.url for server in servers] + [server.secure_url for server in servers],
+                   transportOrigins={origin: server.url for server in servers for origin in (server.url, server.secure_url)},
+                   requestCode=state.request_code, auth=state.auth,
+                   updateNetworkBytes=len(version2.chunks[hashlib.sha1(data(60000, 99)).hexdigest()]),
                    gid1=gid1, gid2=gid2, gidShared=gid_shared, tmp=str(work / 'root'))
+
+    def require_all_node_probe(sha, label, expected_hosts=None):
+        origins = [origin for origin, requested in state.chunk_origins if requested == sha]
+        require(sorted(origins) == sorted(fixture['hosts'] if expected_hosts is None else expected_hosts),
+                label + ': exactly one verified-chunk attempt per declared node')
 
     run('units', fixture)
 
@@ -1126,9 +1377,44 @@ try:
             key = int(line, 16)
             done.add(depot.files[key >> 32]['chunks'][key & 0xffffffff][0].hex())
     require(len(done) >= 1 and len(state.served_ok) >= 1, f'{len(done)} chunks journaled after {len(state.served_ok)} served')
+    require_all_node_probe(hashlib.sha1(GAME_BIN[:60000]).hexdigest(), 'the interrupted install benchmarks all six HTTP/HTTPS nodes')
 
-    # ---- resume: the journaled chunks are not fetched again; the install finishes
+    # ---- a journal is a resume hint, not proof that its bytes still exist.
+    # Mutate one completed chunk in a copy of the interrupted install. Trusting
+    # its journal would keep the wrong byte and omit the required chunk fetch.
     state.limit = None
+    corrupt_root = work / 'corrupt-journal-root'
+    shutil.copytree(root_dir, corrupt_root)
+    corrupt_folder = corrupt_root / 'drive_c/Program Files (x86)/Steam/steamapps/common/Fixture Game'
+    corrupted_sha = None
+    for journal in journals:
+        m = re.match(r'depot_(\d+)_(\d+)\.journal', journal.name)
+        depot = {9001: version1, 9003: shared}[int(m.group(1))]
+        for line in journal.read_text().split():
+            key = int(line, 16)
+            entry = depot.files[key >> 32]
+            sha, offset, length, _, _ = entry['chunks'][key & 0xffffffff]
+            if length:
+                relative = entry['name'].replace('\\', '/').casefold()
+                target = next(p for p in corrupt_folder.rglob('*') if p.is_file() and
+                              p.relative_to(corrupt_folder).as_posix().casefold() == relative)
+                with target.open('r+b') as stream:
+                    stream.seek(offset)
+                    byte = stream.read(1)
+                    stream.seek(offset)
+                    stream.write(bytes([byte[0] ^ 0xff]))
+                corrupted_sha = sha.hex()
+                break
+        if corrupted_sha is not None:
+            break
+    require(corrupted_sha is not None, 'the interrupted fixture has a completed nonempty chunk to corrupt')
+    state.reset_counters()
+    result = run('resume-corrupt', dict(fixture, tmp=str(corrupt_root)))
+    require(result.get('install') == 'ok' and set(state.chunk_requests) & done == {corrupted_sha},
+            'resume re-fetches only the corrupted journaled chunk and preserves the other completed chunks')
+    require(target.read_bytes() == entry['data'], 'resume repairs the actual corrupted bytes before marking the game installed')
+
+    # ---- resume: the unchanged journaled chunks are not fetched again; the install finishes
     state.reset_counters()
     result = run('resume', fixture)
     require(result.get('install') == 'ok' and result.get('listed') == '1', "the install finishes and Madeira Dock's own scanner lists the game as installed")
@@ -1137,10 +1423,10 @@ try:
     require(evil_sha not in state.chunk_requests, 'a manifest path that escapes the install folder is never downloaded')
     expected1 = {'bin/game.bin': GAME_BIN, 'data/Assets.dat': ASSETS, 'empty.txt': b'', 'docs/Readme.TXT': README, 'docs/notes.txt': NOTES,
                  'tool/custom.bin': CUSTOM, 'shared/lib.dat': data(30000, 6)}
-    def tree_matches(expected):
+    def tree_matches(expected, target_folder=folder):
         ok = True
         for name, content in expected.items():
-            file = folder / name
+            file = target_folder / name
             if not file.is_file() or file.read_bytes() != content:
                 print('  mismatch:', name); ok = False
         return ok
@@ -1161,14 +1447,47 @@ try:
     require('"appid"\t\t"9100"' in owner and '"9003"' in owner and '"installdir"\t\t"Fixture Game"' in owner, "the depot's owning app has its own record")
     require((steam_apps / f'depotcache/9001_{gid1}.manifest').read_bytes() == binary1, "the manifest of a depot with per-user executables is kept in depotcache for Valve's client")
     require(not (steam_apps / f'depotcache/9003_{gid_shared}.manifest').exists(), 'other depots leave depotcache alone')
-    require(state.denied == 0, 'every request the downloader made carried the content authorization')
+    require(state.denied == 0 and state.manifest_requests and
+            all(origin.startswith('https://') for origin, _, _ in state.manifest_requests),
+            'production manifests use secure per-origin authorization; HTTP chunks carry no credential')
+    require(any(origin.startswith('http://') for origin, _ in state.chunk_origins) and
+            any(origin.startswith('https://') for origin, _ in state.chunk_origins),
+            'the resume actually exercised encrypted chunks over both fixture transports')
+
+    # ---- a repair of a complete unchanged game checks disk before any probes.
+    state.reset_counters()
+    result = run('recheck', fixture)
+    require(result.get('install') == 'ok' and not state.chunk_requests,
+            'checking an unchanged completed install sends zero chunk requests, including CDN probes')
+    require(tree_matches(expected1), 'checking an unchanged install preserves every existing game byte')
     import urllib.request, urllib.error
-    try:
-        urllib.request.urlopen(good.url + '/depot/9001/chunk/' + evil_sha)
-        refused = False
-    except urllib.error.HTTPError as error:
-        refused = error.code == 403
-    require(refused, 'the server itself refuses a request without the authorization (so the check above means something)')
+    def fixture_get(path, origin):
+        request = urllib.request.Request(good.url + path, headers={'X-Madeira-Fixture-Origin': origin})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response: return response.status, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read()
+
+    manifest_path = f'/depot/9001/manifest/{gid1}/5/{state.request_code}'
+    secure_token = f'{state.auth}-good.fixture.steamcontent.com-9001'
+    require(fixture_get(manifest_path, good.secure_url)[0] == 403,
+            'the fixture refuses a secure manifest without the CDN token')
+    require(fixture_get(manifest_path + f'?auth={state.auth}-flaky.fixture.steamcontent.com-9001', good.secure_url)[0] == 403,
+            'the fixture refuses a token issued for another origin')
+    require(fixture_get(manifest_path + f'?auth={state.auth}-good.fixture.steamcontent.com-9003', good.secure_url)[0] == 403,
+            'the fixture refuses a token issued for another depot')
+    require(fixture_get(manifest_path + f'?auth={secure_token}', good.secure_url) == (200, m1),
+            'the secure manifest requires the correct origin token and manifest request code')
+    require(fixture_get(f'/depot/9001/manifest/{gid1}/5/1?auth={secure_token}', good.secure_url)[0] == 404,
+            'a secure manifest with the wrong request code is refused')
+    require(fixture_get(manifest_path, good.url)[0] == 403,
+            'the fixture never serves a manifest through the HTTP chunk origin')
+    sample_sha = hashlib.sha1(GAME_BIN[:60000]).hexdigest()
+    chunk_path = '/depot/9001/chunk/' + sample_sha
+    require(fixture_get(chunk_path, good.url) == (200, state.depots[9001].chunks[sample_sha]),
+            'an HTTP chunk is served as encrypted bytes without any token')
+    require(fixture_get(chunk_path + f'?auth={secure_token}', good.url)[0] == 403,
+            'the fixture refuses credentials on an HTTP chunk origin')
 
     # ---- update: only what changed is fetched, files shrink
     state.reset_counters()
@@ -1176,6 +1495,7 @@ try:
     new_sha = hashlib.sha1(data(60000, 99)).hexdigest()
     require(result.get('install') == 'ok' and set(state.chunk_requests) == {new_sha},
             f'an update fetches only the chunk that changed ({len(set(state.chunk_requests))} chunk(s))')
+    require_all_node_probe(new_sha, 'the update probes all nodes and reuses a valid changed chunk')
     expected2 = dict(expected1); expected2['bin/game.bin'] = GAME_BIN[:60000] + data(60000, 99) + GAME_BIN[120000:]; expected2['data/Assets.dat'] = ASSETS[:70000]
     require(tree_matches(expected2), 'the updated files have the new bytes, and the file that shrank has no stale tail')
     require('"buildid"\t\t"1001"' in (steam_apps / 'appmanifest_9000.acf').read_text(), 'the record has the new build')
@@ -1191,6 +1511,52 @@ try:
     result = run('refused-licensed', other)
     require(result.get('install') == 'failed' and result.get('listed') == '0' and
             not list((work / 'root2').rglob('appmanifest_*.acf')), 'a refused licensed depot fails the install without a record')
+
+    # ---- the production directory path: both CM recommendations contain the
+    # same three HTTP CN nodes, which refuse chunks; permitted bundled HTTPS
+    # nodes must remain in the transfer pool and complete the actual install.
+    # These are URL identities only: the fail-closed transport maps EVERY one
+    # directly to loopback, without resolving or contacting any Steam/CDN host.
+    forbidden = ContentServer('forbidden', state)
+    servers.append(forbidden)
+    serve(forbidden)
+    cn_hosts = ['st.dl.eccdnx.com', 'dl.steam.clngaa.com', 'xz.pphimalayanrt.com']
+    fallback_hosts = ['cache2-hkg1.steamcontent.com', 'cache4-hkg1.steamcontent.com',
+                      'fastly.cdn.steampipe.steamcontent.com', 'steampipe.akamaized.net']
+    cn_origins = ['http://' + host for host in cn_hosts]
+    fallback_origins = ['https://' + host for host in fallback_hosts]
+    regression_origins = {**{origin: forbidden.url for origin in cn_origins},
+                          **{origin: good.url for origin in fallback_origins}}
+    state.extra_origins = regression_origins
+    state.limit = None
+    state.reset_counters()
+    regression = dict(fixture, tmp=str(work / 'directory-root'), directoryHosts=cn_hosts,
+                      authorizedSecureHosts=fallback_hosts,
+                      hosts=cn_origins + fallback_origins, transportOrigins=regression_origins)
+    result = run('directory-fallback', regression, timeout=120)
+    require(result.get('install') == 'ok' and result.get('listed') == '1',
+            'the real directory-to-install path survives three CN HTTP 403 nodes using permitted HTTPS transfer fallbacks')
+    first_sha = hashlib.sha1(GAME_BIN[:60000]).hexdigest()
+    shared_sha = hashlib.sha1(data(30000, 6)).hexdigest()
+    require_all_node_probe(first_sha, 'production discovery preserves all three CN nodes and four secure fallbacks', regression['hosts'])
+    require_all_node_probe(shared_sha, 'the shared depot also benchmarks the discovered and secure fallback pool', regression['hosts'])
+    require(sorted(origin for origin, sha in state.chunk_refusals if sha == first_sha) == sorted(cn_origins),
+            'each declared CN HTTP node actually returned 403 for the representative encrypted chunk')
+    require(state.denied == 0 and state.manifest_requests and
+            all(origin in fallback_origins for origin, _, _ in state.manifest_requests),
+            'directory regression manifests and CDN tokens stay on authorized secure fallback origins')
+    regression_apps = work / 'directory-root/drive_c/Program Files (x86)/Steam/steamapps'
+    regression_folder = regression_apps / 'common/Fixture Game'
+    require(tree_matches(expected1, regression_folder),
+            'HTTPS fallback installs every file with the independent original depot bytes')
+    require(sorted(str(p.relative_to(regression_folder)) for p in regression_folder.rglob('*') if p.is_file()) == sorted(expected1),
+            'the directory regression creates exactly the permitted files and excludes hostile paths')
+    regression_record = regression_apps / 'appmanifest_9000.acf'
+    require(regression_record.is_file() and '"StateFlags"\t\t"4"' in regression_record.read_text() and
+            '"buildid"\t\t"1000"' in regression_record.read_text() and
+            (regression_apps / 'appmanifest_9100.acf').is_file() and
+            not (regression_apps / 'downloading/9000').exists(),
+            'the production directory regression commits both installed records and retires its journal')
 finally:
     for server in servers:
         server.shutdown(); server.server_close()

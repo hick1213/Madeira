@@ -17,6 +17,7 @@ private struct DDIPaths {
 
 private enum StikJIT {
     enum Script { case customBase64(String) }
+    struct Configuration { init(rsdPort: UInt16) {} }
     struct DeviceSecurityState { let isTXMPresent: Bool? }
     enum PreparationStage { case unavailable }
     enum JITReadiness {
@@ -26,11 +27,11 @@ private enum StikJIT {
     }
 
     static var isTXMPresent: Bool? { nil }
-    static func prepareDevice(pairingFile: URL, paths: DDIPaths,
+    static func prepareDevice(pairingFile: URL, paths: DDIPaths, configuration: Configuration,
                               progress: (PreparationStage) -> Void) -> JITReadiness {
         .unreachable(reason: "Built-in JIT is available only on a physical device.")
     }
-    static func enableJIT(targetPID: Int32, pairingFile: URL, ddiPaths: DDIPaths,
+    static func enableJIT(targetPID: Int32, pairingFile: URL, ddiPaths: DDIPaths, configuration: Configuration,
                           script: Script, forceScript: Bool,
                           preparationProgress: (PreparationStage) -> Void,
                           progress: (String) -> Void) throws {
@@ -68,11 +69,12 @@ private enum MadeiraJITWork {
             let pairingURL = root.appendingPathComponent("pairingFile-\(UUID().uuidString).plist")
             try pairingData.write(to: pairingURL, options: .atomic)
             defer { try? manager.removeItem(at: pairingURL) }
+            let configuration = StikJIT.Configuration(rsdPort: request.rsdPort ?? 49152)
 
             switch request.operation {
             case .prepare:
                 let readiness = StikJIT.prepareDevice(
-                    pairingFile: pairingURL, paths: paths,
+                    pairingFile: pairingURL, paths: paths, configuration: configuration,
                     progress: { NSLog("[MadeiraJIT] prepare: %@", String(describing: $0)) })
                 switch readiness {
                 case .ready(let security):
@@ -99,6 +101,7 @@ private enum MadeiraJITWork {
                     targetPID: targetPID,
                     pairingFile: pairingURL,
                     ddiPaths: paths,
+                    configuration: configuration,
                     script: .customBase64(scriptBase64),
                     forceScript: true,
                     preparationProgress: {

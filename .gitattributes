@@ -1,1 +1,6 @@
 app/Frameworks/StikJIT.xcframework/** -whitespace
+
+# Preserve vendored and pinned source/notice bytes, including original endings.
+experiments/legacy-luajit/upstream/** -text -whitespace
+experiments/legacy-luajit/runtime/** -text -whitespace
+app/Madeira/arm64ec-windows/madeira-steam-components/SDL3-NOTICES.txt -text -whitespace

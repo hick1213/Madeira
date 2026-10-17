@@ -376,17 +376,22 @@ final class JITCoordinator: ObservableObject {
         busy = true
         error = nil
         connectionProblem = nil
-        status = "Checking LocalDevVPN and the Developer Disk Image…"
-        MadeiraBuiltInJIT.send(.prepare(pairingData: pairing)) { [weak self] result in
+        status = "Finding this device's JIT service…"
+        JITRemoteEndpoint.resolve(pairingData: pairing) { [weak self] port in
             guard let self else { return }
-            busy = false
-            switch result {
-            case .success(let response):
-                txmPresent = response.txmPresent
-                status = response.success ? response.message : nil
-                error = response.success ? nil : helperFailure(response.message)
-            case .failure(let failure):
-                error = failure.localizedDescription
+            LogStore.shared.log("[jit-endpoint] prepare: remote-pairing port=\(port)")
+            status = "Checking LocalDevVPN and the Developer Disk Image…"
+            MadeiraBuiltInJIT.send(.prepare(pairingData: pairing, rsdPort: port)) { [weak self] result in
+                guard let self else { return }
+                busy = false
+                switch result {
+                case .success(let response):
+                    txmPresent = response.txmPresent
+                    status = response.success ? response.message : nil
+                    error = response.success ? nil : helperFailure(response.message)
+                case .failure(let failure):
+                    error = failure.localizedDescription
+                }
             }
         }
     }
@@ -414,12 +419,21 @@ final class JITCoordinator: ObservableObject {
 
         busy = true
         error = nil
+        status = "Finding this device's JIT service…"
+        JITRemoteEndpoint.resolve(pairingData: pairing) { [weak self] port in
+            self?.startBuiltIn(pairing: pairing, script: script, rsdPort: port, completion: completion)
+        }
+    }
+
+    private func startBuiltIn(pairing: Data, script: Data, rsdPort: UInt16,
+                              completion: @escaping (Result<Void, Error>) -> Void) {
+        LogStore.shared.log("[jit-endpoint] enable: remote-pairing port=\(rsdPort)")
         status = "Starting Madeira's JIT helper…"
         var readinessTimer: Timer?
         var readinessFinished = false
         MadeiraBuiltInJIT.send(
             .enable(targetPID: getpid(), pairingData: pairing,
-                    scriptBase64: script.base64EncodedString()),
+                    scriptBase64: script.base64EncodedString(), rsdPort: rsdPort),
             started: { [weak self] in
                 self?.status = "Waiting for Madeira's JIT helper to attach…"
                 readinessTimer = StikJITHelper.waitForDebugger { [weak self] result in
@@ -468,6 +482,12 @@ final class JITCoordinator: ObservableObject {
     /// (the helper's own message is already in the log).
     private func helperFailure(_ message: String) -> String {
         connectionProblem = ConnectionProblem(helperMessage: message) ?? (loopbackAnswered == false ? .vpn : nil)
+        if connectionProblem == .vpn, loopbackAnswered == true {
+            // lockdownd answered, but a different Remote Pairing/service port
+            // failed. Keep the actual endpoint error instead of claiming VPN is off.
+            connectionProblem = nil
+            return message + " Keep this device unlocked with Wi-Fi on, then try again."
+        }
         return connectionProblem?.message ?? message
     }
 

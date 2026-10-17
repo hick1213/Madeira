@@ -52,7 +52,35 @@ struct DockGame: Identifiable, Equatable, Sendable {
 /// with a report code.
 ///
 /// The app side is this contract: environment variables, a one-use sign-in
-/// transfer file and a numeric report file (C:\madeira-dock.txt).
+/// transfer file and a numeric report file in a per-launch namespace.
+/// A completed Dock game may close only its own still-running desktop session.
+/// Report namespaces and native control tokens are deliberately independent.
+struct DockSessionCloseGate {
+    let sessionID: UUID
+    let baselineToken: UInt64
+    private var token: UInt64?
+    private var sent = false
+    private var sawRunning = false
+
+    mutating func request(reportSessionID: UUID?, fields: [String: String], controlToken: UInt64,
+                          wineRunning: Bool) -> UInt64? {
+        guard !sent, reportSessionID == sessionID, wineRunning else { return nil }
+        if token == nil {
+            guard controlToken > baselineToken else { return nil }
+            token = controlToken
+        }
+        guard token == controlToken else { return nil }
+        if fields["launch-game-running"] == "1" { sawRunning = true }
+        guard sawRunning, fields["launch-game-ended"] == "1", fields["shutdown-complete"] == "1",
+              fields["probe-result"].flatMap(Int32.init) != nil else { return nil }
+        return controlToken
+    }
+
+    mutating func queued(token accepted: UInt64) {
+        if token == accepted { sent = true }
+    }
+}
+
 enum MadeiraDock {
     /// `env.MADEIRA_DOCK = 0` hides Dock. Without a built dockhost.exe it is hidden too.
     static var enabled: Bool { SteamSignIn.flag("MADEIRA_DOCK", default: true) && bundled }
@@ -95,12 +123,14 @@ enum MadeiraDock {
     /// Installed games in the client's own library (`<client>/steamapps`) and the other
     /// libraries on C: that its `libraryfolders.vdf` lists. Read-only.
     static func games(drive: URL) -> [DockGame] {
+        guard !Task.isCancelled else { return [] }
         let fm = FileManager.default
         let clientLibrary = SteamRuntimeFiles.relativeRoot + "/steamapps"
         var libraries = [clientLibrary]
         if let data = try? Data(contentsOf: drive.appendingPathComponent(clientLibrary + "/libraryfolders.vdf")),
            data.count <= 1 << 20, var parser = try? SteamKeyValues(data), let root = try? parser.read() {
             for (_, entry) in (root["libraryfolders"]?.fields ?? [:]).sorted(by: { $0.key < $1.key }) {
+                guard !Task.isCancelled else { return [] }
                 guard let path = entry["path"]?.string?.replacingOccurrences(of: "\\\\", with: "\\"),
                       let relative = libraryRelative(path) else { continue }
                 if !libraries.contains(where: { $0.caseInsensitiveCompare(relative) == .orderedSame }) { libraries.append(relative) }
@@ -108,10 +138,12 @@ enum MadeiraDock {
         }
         var result: [DockGame] = []
         for library in libraries.prefix(16) {
+            guard !Task.isCancelled else { return [] }
             let folder = drive.appendingPathComponent(library, isDirectory: true)
             guard folder.resolvingSymlinksInPath().path.hasPrefix(drive.resolvingSymlinksInPath().path + "/"),
                   let names = try? fm.contentsOfDirectory(atPath: folder.path) else { continue }
             for file in names.sorted().prefix(2000) where file.hasPrefix("appmanifest_") && file.hasSuffix(".acf") {
+                guard !Task.isCancelled else { return [] }
                 guard let data = try? Data(contentsOf: folder.appendingPathComponent(file)),
                       let game = game(manifest: data, library: library),
                       !result.contains(where: { $0.id == game.id }) else { continue }
@@ -197,6 +229,7 @@ enum MadeiraDock {
 
     /// The host's report: a bounded set of numeric fields, never arbitrary guest text.
     struct Report {
+        var sessionID: UUID? = nil
         var fields: [String: String] = [:]
         var result: Int? { fields["probe-result"].flatMap(Int.init) }
         var failure: String? {
@@ -284,6 +317,7 @@ enum MadeiraDock {
     }
 
     static let reportAllowed: Set<String> = ["probe-start-bits", "client-machine", "client-pe-timestamp",
+        "sdl-component-stage", "sdl-component-error",
         "load-client-begin", "load-client-error", "public-client021-present", "engine005-present",
         "engine-factory-result", "session-client-adapter", "session-unsupported-client", "session-user-method-mismatch",
         "session-private-abi-verified", "session-login-disabled", "session-native-handoff-invalid",
@@ -299,7 +333,7 @@ enum MadeiraDock {
         "session-offline-logon-retry", "session-offline-logon-state", "session-offline-callback-id",
         "session-offline-entitled", "session-offline-listed", "session-offline-timeout-state",
         "session-offline-fallback", "session-offline-ready",
-        "launch-client-error", "launch-option-index", "launch-option-invalid", "launch-option-missing",
+        "launch-game-running", "launch-game-ended", "launch-client-error", "launch-option-index", "launch-option-invalid", "launch-option-missing",
         "launch-update-wait", "launch-update-retry", "launch-update-ready",
         "launch-config-wait", "launch-config-gave-up", "launch-session-wait", "launch-session-gave-up",
         "ceg-request", "ceg-request-result", "ceg-request-busy", "ceg-server-result", "ceg-job-result",
@@ -338,14 +372,25 @@ enum MadeiraDock {
     }
 
     @MainActor private static var lastReport = Report()
+    @MainActor private static var reportSessionID: UUID?
+    @MainActor private static var reportURL: URL?
+    @MainActor static func beginReportSession(_ id: UUID) {
+        // A unique per-launch path cannot expose an earlier host's final report.
+        let name = "madeira-dock-" + id.uuidString.lowercased() + ".txt"
+        reportSessionID = id
+        reportURL = drive.appendingPathComponent(name)
+        lastReport = Report(sessionID: id)
+        setenv("MADEIRA_STEAM_HOST_LOG", "C:\\" + name, 1)
+    }
 
-    /// Reads C:\madeira-dock.txt and logs fields that changed ([dock-report]).
+    /// Reads the current numeric report and logs changed fields ([dock-report]).
     @MainActor static func pollReport() -> Report {
-        let url = drive.appendingPathComponent("madeira-dock.txt")
+        let url = reportURL ?? drive.appendingPathComponent("madeira-dock.txt")
         guard let file = try? FileHandle(forReadingFrom: url) else { return lastReport }
         defer { try? file.close() }
         guard let data = try? file.read(upToCount: 32769), data.count <= 32768 else { return lastReport }
-        let report = parseReport(data)
+        var report = parseReport(data)
+        report.sessionID = reportSessionID
         for key in report.fields.keys.sorted() where report.fields[key] != lastReport.fields[key] {
             SteamLog.event("[dock-report] \(key)=\(report.fields[key]!)")
         }
@@ -381,6 +426,8 @@ enum MadeiraDock {
     /// token, account name or path is logged.
     @MainActor static func writeHandoff(account: String, token: String, appID: Int) throws {
         cleanup()
+        reportSessionID = nil
+        reportURL = nil
         lastReport = Report()
         let report = drive.appendingPathComponent("madeira-dock.txt")
         if FileManager.default.fileExists(atPath: report.path) { try FileManager.default.removeItem(at: report) }
@@ -408,7 +455,8 @@ enum MadeiraDock {
     }
 
     /// The host's environment for one launch.
-    static func configure(_ game: DockGame, launchOption: UInt32 = 0) {
+    @MainActor static func configure(_ game: DockGame, launchOption: UInt32 = 0) {
+        reportSessionID = nil; reportURL = nil; lastReport = Report()
         for key in ["MADEIRA_STEAM_HOST_PROBE", "MADEIRA_STEAM_HOST_SESSION", "MADEIRA_STEAM_HOST_LOGIN", "MADEIRA_STEAM_HOST_LAUNCH"] {
             setenv(key, "1", 1)
         }

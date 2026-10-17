@@ -98,6 +98,7 @@
 #include "wine/asm.h"
 #include "unix_private.h"
 #include "ios_wow.h"
+#include "ios_native_lifetime.h"
 #include "wine/debug.h"
 
 /* defined at the bottom of this file with the [thread-stacks] dumper */
@@ -256,6 +257,37 @@ struct syscall_frame
 C_ASSERT( sizeof( struct syscall_frame ) == 0x330 );
 
 #ifdef WINE_IOS
+struct ios_quit_thread_data
+{
+    volatile sig_atomic_t pending;
+    volatile sig_atomic_t restore_sigquit;
+};
+
+C_ASSERT( sizeof(struct ios_quit_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
+C_ASSERT( offsetof(TEB, GdiTebBatch) + offsetof(struct ntdll_thread_data, cpu_data) == 0x2f0 );
+C_ASSERT( offsetof(struct ios_quit_thread_data, pending) == 0 && sizeof(sig_atomic_t) == 4 );
+
+static struct ios_quit_thread_data *ios_quit_data( TEB *teb )
+{
+    return (struct ios_quit_thread_data *)((struct ntdll_thread_data *)&teb->GdiTebBatch)->cpu_data;
+}
+
+extern char ios_syscall_quit_begin[] __asm__( __ASM_LOCAL_LABEL("ios_syscall_quit_begin") ) __attribute__((visibility("hidden")));
+extern char ios_syscall_quit_end[] __asm__( __ASM_LOCAL_LABEL("ios_syscall_quit_end") ) __attribute__((visibility("hidden")));
+extern char ios_unixcall_quit_begin[] __asm__( __ASM_LOCAL_LABEL("ios_unixcall_quit_begin") ) __attribute__((visibility("hidden")));
+extern char ios_unixcall_quit_end[] __asm__( __ASM_LOCAL_LABEL("ios_unixcall_quit_end") ) __attribute__((visibility("hidden")));
+
+/* Only these assembly instructions are safe after the final pending read:
+ * native callees have returned, and the epilogues hold no native locks. A C
+ * slowpath called from this range has its own PC outside the safe range. */
+static BOOL ios_quit_in_return_epilogue( ULONG_PTR pc )
+{
+    return (pc >= (ULONG_PTR)ios_syscall_quit_begin && pc < (ULONG_PTR)ios_syscall_quit_end) ||
+           (pc >= (ULONG_PTR)ios_unixcall_quit_begin && pc < (ULONG_PTR)ios_unixcall_quit_end);
+}
+#endif
+
+#ifdef WINE_IOS
 /* Written by __wine_syscall_dispatcher at entry to capture the actual x18 value.
  * Read by the watchdog to verify whether x18 is TEB or 0. */
 volatile uint64_t g_wine_dispatcher_x18 = 0xDEADDEAD;
@@ -286,6 +318,13 @@ static __thread uintptr_t ios_teb_for_signals = 0;
 pthread_key_t ios_teb_tls_key = 0;
 int ios_teb_tls_slot_offset = 0;  /* byte offset from TPIDRRO_EL0 base to TEB slot */
 int ios_teb_tls_key_created = 0;
+
+/* Native bridge cleanup, after Wine teardown and before host pool draining.
+ * Key zero is only the initializer, not an owned key before allocation. */
+void ios_clear_thread_teb_mirror(void)
+{
+    if (ios_teb_tls_key_created) pthread_setspecific( ios_teb_tls_key, NULL );
+}
 
 /*
  * Per-thread Mach exception handler for EXC_BAD_ACCESS.
@@ -546,9 +585,38 @@ struct ios_thread_entry {
     thread_t mach_thread;
     uintptr_t teb;
     void *trampoline;
+    uint64_t native_generation;
+    unsigned retained_refs;
 };
 static struct ios_thread_entry ios_thread_registry[IOS_MAX_WINE_THREADS];
 static volatile int32_t ios_thread_count = 0;
+static pthread_mutex_t ios_thread_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Called only after the lifetime core confirms death of its pinned endpoint.
+ * Compare immutable generation and identity, never dereference an old TEB. */
+void ios_thread_registry_native_dead( mach_port_t endpoint, void *teb, uint64_t generation )
+{
+    int i;
+    pthread_mutex_lock( &ios_thread_registry_lock );
+    for (i = 0; i < ios_thread_count && i < IOS_MAX_WINE_THREADS; i++)
+    {
+        struct ios_thread_entry *entry = &ios_thread_registry[i];
+        if (entry->mach_thread != endpoint || entry->teb != (uintptr_t)teb ||
+            entry->native_generation != generation) continue;
+        entry->mach_thread = 0;
+        __sync_synchronize();
+        entry->teb = 0;
+        entry->trampoline = NULL;
+        entry->native_generation = 0;
+        while (entry->retained_refs)
+        {
+            mach_port_deallocate( mach_task_self(), endpoint );
+            entry->retained_refs--;
+        }
+        break;
+    }
+    pthread_mutex_unlock( &ios_thread_registry_lock );
+}
 
 /* Exact-match registry probe — NO slot-0 fallback.
  *
@@ -1368,6 +1436,21 @@ static int ios_fault_read_insn( uint64_t fault_pc, uint32_t *out )
         return 0;
     }
     return 1;
+}
+
+/* This app-owned handshake still declines to the existing SIGTRAP path. Only
+ * its crash diagnostics are inapplicable; it must not consume the first real
+ * unhandled fault's dump quota. A matching immediate at any other PC is not
+ * enough, nor is the sticky CS_DEBUGGED flag evidence of debugger ownership. */
+static int ios_is_native_detach_breakpoint( int exception, const arm_thread_state64_t *state )
+{
+    extern const char jit26_detach_breakpoint[];
+    uint64_t pc = arm_thread_state64_get_pc( *state );
+    uint32_t insn;
+
+    return exception == EXC_BREAKPOINT &&
+           pc == (uintptr_t)jit26_detach_breakpoint && state->__x[16] == 0 &&
+           ios_fault_read_insn( pc, &insn ) && insn == 0xd43e01a0;
 }
 
 /* x18-derived base register.
@@ -3909,17 +3992,22 @@ static void *ios_mach_exception_thread( void *arg )
                             }
                         }
                     }
-                    /* FEX's native backpatch lock uses CASAL on the pool RX
-                     * view. Handle it before Mach-to-guest delivery; otherwise
-                     * a host-runtime fault escapes into the guest's VEH.
-                     * Deliberately limited to full-width accesses within the
-                     * existing pool alias; no new mapping or permission grant. */
-                    if (!emulated && in_jit &&
+                    /* CAS also targets registered anonymous code aliases, as
+                     * CoreCLR's generated stubs do. Both routes require full
+                     * operand coverage in an existing writable alias; this
+                     * creates no mapping and changes no permissions. */
+                    if (!emulated &&
                         (insn & 0xbfa07c00u) == 0x88a07c00u)
                     {
+                        extern int ios_jit_anon_alias_find_cover(void *, size_t, void **, void **);
                         unsigned cas_width = (insn & 0x40000000u) ? 8 : 4;
-                        if (sz >= cas_width && fault_addr - rx <= sz - cas_width &&
-                            ios_mach_emulate_cas(insn, rw_addr, state.__x))
+                        void *cas_rw = NULL;
+                        int cas_covered = in_jit
+                            ? sz >= cas_width && fault_addr - rx <= sz - cas_width
+                            : fault_addr <= ~(uintptr_t)0 - cas_width &&
+                              ios_jit_anon_alias_find_cover((void *)fault_addr, cas_width, &cas_rw, NULL) &&
+                              (uintptr_t)cas_rw == rw_addr;
+                        if (cas_covered && ios_mach_emulate_cas(insn, rw_addr, state.__x))
                         {
                             static unsigned cas_mach_logs;
                             emulated = 1;
@@ -4602,7 +4690,7 @@ skip_reclaim_band: ;
             if (handled)
                 thread_set_state( thread, ARM_THREAD_STATE64,
                                   (thread_state_t)&state, count );
-            else
+            else if (!ios_is_native_detach_breakpoint( req->exception, &state ))
             {
                 /* Rate-limit: log first 5 unhandled faults then every 100th */
                 static volatile int unhandled_count = 0;
@@ -6147,9 +6235,11 @@ static void ios_install_task_exception_port(void)
 /* Register a Wine "process" thread with the shared Mach exception handler.
  * First call creates the shared port and handler thread.
  * Every call registers the thread and sets its exception ports. */
-static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
+static int ios_setup_mach_exception_handler_locked( thread_t pe_thread, uintptr_t teb,
                                                void *trampoline )
 {
+    uint64_t generation = ios_native_current_generation();
+    if (!generation) return 0;
     /* One-time initialization: create shared port and handler thread */
     if (!ios_exc_handler_started)
     {
@@ -6158,11 +6248,11 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
 
         kern_return_t kr = mach_port_allocate( mach_task_self(),
                                                 MACH_PORT_RIGHT_RECEIVE, &ios_exc_port );
-        if (kr != KERN_SUCCESS) { ERR("mach exc port allocate: kr=%d\n", kr); return; }
+        if (kr != KERN_SUCCESS) { ERR("mach exc port allocate: kr=%d\n", kr); return 0; }
 
         kr = mach_port_insert_right( mach_task_self(), ios_exc_port, ios_exc_port,
                                       MACH_MSG_TYPE_MAKE_SEND );
-        if (kr != KERN_SUCCESS) { ERR("mach exc port insert: kr=%d\n", kr); return; }
+        if (kr != KERN_SUCCESS) { ERR("mach exc port insert: kr=%d\n", kr); return 0; }
 
         {
             const char *e = getenv( "MADEIRA_MACH_ALIGN_FAULT" );
@@ -6200,7 +6290,7 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
     int idx, reg_count = __sync_fetch_and_add(&ios_thread_count, 0);
     if (reg_count > IOS_MAX_WINE_THREADS) reg_count = IOS_MAX_WINE_THREADS;
     for (idx = 0; idx < reg_count; idx++)
-        if (ios_thread_registry[idx].mach_thread == pe_thread) break;
+        if (ios_thread_registry[idx].mach_thread == pe_thread || !ios_thread_registry[idx].mach_thread) break;
     if (idx == reg_count)
     {
         idx = __sync_fetch_and_add(&ios_thread_count, 1);
@@ -6214,6 +6304,9 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
     }
     if (idx >= 0)
     {
+        if (ios_thread_registry[idx].mach_thread &&
+            (ios_thread_registry[idx].native_generation != generation ||
+             ios_thread_registry[idx].teb != teb)) return 0;
         /* ml390 (task #66): make the replace path LOUD.  If a name gets
          * recycled while its previous owner still has live guest state, this
          * overwrite silently redirects that thread's TEB resolution — and a
@@ -6226,6 +6319,7 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
                  idx, pe_thread, (void *)ios_thread_registry[idx].teb, (void *)teb );
         ios_thread_registry[idx].teb = teb;
         ios_thread_registry[idx].trampoline = trampoline;
+        ios_thread_registry[idx].native_generation = generation;
         __sync_synchronize();
         ios_thread_registry[idx].mach_thread = pe_thread;
         /* ml401 (tasks #60/#66): EVERY registry port name proved
@@ -6241,8 +6335,10 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
                                                     MACH_PORT_RIGHT_SEND, 4 );
             if (krr != KERN_SUCCESS)
                 ERR( "[thread-registry] mod_refs(+4) port=0x%x FAILED kr=%d\n", pe_thread, krr );
+            else ios_thread_registry[idx].retained_refs += 4;
         }
     }
+    else return 0; /* never enter PE code without a bounded matching registry slot */
 
     /* Set exception port for this thread (shared port).
      * ml353: also claim EXC_BAD_INSTRUCTION. udf-class faults (executing
@@ -6258,10 +6354,20 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
                                       ios_exc_port,
                                       (exception_behavior_t)(EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES),
                                       ARM_THREAD_STATE64 );
-    if (kr != KERN_SUCCESS) { ERR("mach exc set ports: kr=%d thread=0x%x\n", kr, pe_thread); return; }
+    if (kr != KERN_SUCCESS) { ERR("mach exc set ports: kr=%d thread=0x%x\n", kr, pe_thread); return 0; }
 
     ERR("Mach exception handler registered thread 0x%x (idx=%d), teb=%p tramp=%p usd=%p mask=ba+bi rev=ml353\n",
         pe_thread, idx, (void*)teb, trampoline, (void*)ios_exc_usd);
+    return 1;
+}
+
+static int ios_setup_mach_exception_handler( thread_t thread, uintptr_t teb, void *trampoline )
+{
+    int ok;
+    pthread_mutex_lock( &ios_thread_registry_lock );
+    ok = ios_setup_mach_exception_handler_locked( thread, teb, trampoline );
+    pthread_mutex_unlock( &ios_thread_registry_lock );
+    return ok;
 }
 #endif
 
@@ -7055,10 +7161,11 @@ static inline void ios_fixup_x18_for_return( ucontext_t *context );
 static void ios_log_guest_exception( const char *via, const EXCEPTION_RECORD *rec, ULONG64 pc )
 {
     static volatile int exc_logged = 0;
+    TEB *teb = NtCurrentTeb();
     int n = __sync_add_and_fetch(&exc_logged, 1);
     if (n > 80) return;
     dprintf(2, "[exc-disp] %s tid=%04x code=%08x flags=%x addr=%p pc=%llx nparams=%u p0=%llx p1=%llx\n",
-            via, (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+            via, teb ? (unsigned int)(ULONG_PTR)teb->ClientId.UniqueThread : 0,
             (unsigned int)rec->ExceptionCode, (unsigned int)rec->ExceptionFlags,
             rec->ExceptionAddress, (unsigned long long)pc, (unsigned int)rec->NumberParameters,
             rec->NumberParameters > 0 ? (unsigned long long)rec->ExceptionInformation[0] : 0,
@@ -13192,10 +13299,13 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 #ifdef WINE_IOS
     ios_track_signal( signal, context );
     if (!ios_thread_ctl_has_teb())
+        return;
+    if (is_inside_syscall( SP_sig(context) ) &&
+        !ios_quit_in_return_epilogue( PC_sig(context) ))
     {
-        static int noteb_quit;
-        if (noteb_quit < 4) { noteb_quit++;
-            dprintf( 2, "[sig-noteb] SIGQUIT on a TEB-less thread — ignoring rev=ml483\n" ); }
+        /* A native callee may own libc, loader, registry or JIT locks. Keep
+         * its ownership until it returns, even if the operation never ends. */
+        ios_quit_data( NtCurrentTeb() )->pending = 1;
         return;
     }
 #endif
@@ -13279,6 +13389,17 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         return;
     }
 
+#ifdef WINE_IOS
+    /* The slowpath blocks SIGQUIT through raise(). Restore its original bit
+     * only when this handler actually resumes the guest, so a queued quit
+     * cannot abandon a libc frame inside raise(). */
+    if (ios_quit_data( NtCurrentTeb() )->restore_sigquit)
+    {
+        sigdelset( &context->uc_sigmask, SIGQUIT );
+        ios_quit_data( NtCurrentTeb() )->restore_sigquit = 0;
+    }
+#endif
+
     FP_sig(context)     = frame->fp;
     LR_sig(context)     = frame->lr;
     SP_sig(context)     = frame->sp;
@@ -13326,6 +13447,11 @@ void signal_init_threading(void)
  */
 NTSTATUS signal_alloc_thread( TEB *teb )
 {
+#ifdef WINE_IOS
+    /* Allocated before the thread is made ready for native termination. */
+    ios_quit_data( teb )->pending = 0;
+    ios_quit_data( teb )->restore_sigquit = 0;
+#endif
     return STATUS_SUCCESS;
 }
 
@@ -13355,7 +13481,12 @@ void signal_init_process(void)
     /* Create TLS key for TEB storage (used by x18 binary patcher trampolines) */
     if (!ios_teb_tls_key_created)
     {
-        pthread_key_create(&ios_teb_tls_key, NULL);
+        int error = pthread_key_create(&ios_teb_tls_key, NULL);
+        if (error)
+        {
+            dprintf( 2, "[teb-tsd] pthread_key_create failed: %d\n", error );
+            exit(1); /* no mirror writes may follow without an owned key */
+        }
         ios_teb_tls_key_created = 1;
     }
 #endif
@@ -13396,7 +13527,22 @@ void signal_init_process(void)
  */
 void syscall_dispatcher_return_slowpath(void)
 {
+#ifdef WINE_IOS
+    struct ios_quit_thread_data *data = ios_quit_data( NtCurrentTeb() );
+    sigset_t mask, previous;
+
+    sigemptyset( &mask );
+    sigaddset( &mask, SIGQUIT );
+    pthread_sigmask( SIG_BLOCK, &mask, &previous );
+    if (data->pending) abort_thread( 0 );
+    data->restore_sigquit = !sigismember( &previous, SIGQUIT );
+#endif
     raise( SIGUSR2 );
+#ifdef WINE_IOS
+    /* Normally SIGUSR2 restores the guest context and does not return here. */
+    data->restore_sigquit = 0;
+    pthread_sigmask( SIG_SETMASK, &previous, NULL );
+#endif
 }
 
 /***********************************************************************
@@ -13747,8 +13893,9 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     }
     /* Register this thread with the shared Mach exception handler.
      * First call creates the handler thread; all calls register the thread. */
-    ios_setup_mach_exception_handler( pthread_mach_thread_np(pthread_self()),
-                                       (uintptr_t)teb, ios_my_trampoline );
+    if (!ios_setup_mach_exception_handler( pthread_mach_thread_np(pthread_self()),
+                                          (uintptr_t)teb, ios_my_trampoline ) ||
+        !ios_native_ready_current( teb )) abort_thread( 1 );
     /* Give the handler thread a moment to start (only needed for first thread) */
     if (!ios_exc_thread_alive) usleep(10000);
     ERR("init_syscall_frame: mach exc thread alive=%d, slot=%d\n",
@@ -13903,6 +14050,18 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    __ASM_CFI_CFA_IS_AT2(sp, 0x98, 0x02) /* frame->syscall_cfa */
                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") ":\n\t"
 #ifdef WINE_IOS
+                   __ASM_LOCAL_LABEL("ios_syscall_quit_begin") ":\n\t"
+                   /* Saved x18 is guest register state and may be zero after
+                    * an iOS context switch. Native identity comes from TSD;
+                    * keep it in x10, which the OS does not clear like x18. */
+                   "mrs x10, TPIDRRO_EL0\n\t"
+                   "and x10, x10, #~7\n\t"
+                   "adrp x11, " __ASM_NAME("ios_teb_tls_slot_offset") "@PAGE\n\t"
+                   "ldr w11, [x11, " __ASM_NAME("ios_teb_tls_slot_offset") "@PAGEOFF]\n\t"
+                   "ldr x10, [x10, x11]\n\t"
+                   "ldr w11, [x10, #0x2f0]\n\t" /* ios_quit_thread_data.pending */
+                   "cbnz w11, " __ASM_LOCAL_LABEL("ios_native_quit") "\n"
+                   __ASM_LOCAL_LABEL("ios_syscall_quit_checked") ":\n\t"
                    /* Trace: capture frame->x[18] and frame->pc before they are loaded */
                    "ldr x10, [sp, #0x90]\n\t"   /* frame->x[18] - will become x18 */
                    "adrp x11, " __ASM_NAME("g_wine_return_x18") "@PAGE\n\t"
@@ -13933,6 +14092,16 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "ccmp x13, x14, #0, eq\n\t"     /* frame->x17 == frame->sp? */
                    "beq 1f\n\t"                    /* take slowpath if unequal */
                    "bl " __ASM_NAME("syscall_dispatcher_return_slowpath") "\n"
+#ifdef WINE_IOS
+                   /* A normally returning slowpath may have deferred SIGQUIT. */
+                   "mrs x10, TPIDRRO_EL0\n\t"
+                   "and x10, x10, #~7\n\t"
+                   "adrp x11, " __ASM_NAME("ios_teb_tls_slot_offset") "@PAGE\n\t"
+                   "ldr w11, [x11, " __ASM_NAME("ios_teb_tls_slot_offset") "@PAGEOFF]\n\t"
+                   "ldr x10, [x10, x11]\n\t"
+                   "ldr w11, [x10, #0x2f0]\n\t"
+                   "cbnz w11, " __ASM_LOCAL_LABEL("ios_native_quit") "\n"
+#endif
                    "1:\tldp x0, x1, [sp, #0x00]\n\t"
                    "ldp x2, x3, [sp, #0x10]\n\t"
                    "ldp x4, x5, [sp, #0x20]\n\t"
@@ -13981,6 +14150,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    /* switch to user stack */
                    "mov sp, x17\n\t"
                    "ret x16\n"
+#ifdef WINE_IOS
+                   __ASM_LOCAL_LABEL("ios_syscall_quit_end") ":\n"
+                   __ASM_LOCAL_LABEL("ios_native_quit") ":\n\t"
+                   "mov w0, #0\n\t"
+                   "bl " __ASM_NAME("abort_thread") "\n"
+#endif
 
                    __ASM_LOCAL_LABEL("trace_syscall") ":\n\t"
                    "stp x0, x1, [sp, #-0x40]!\n\t"
@@ -14137,6 +14312,17 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "mov x0, x2\n\t"             /* args */
                    "blr x16\n"
                    __ASM_LOCAL_LABEL("unixcall_return") ":\n\t"
+#ifdef WINE_IOS
+                   __ASM_LOCAL_LABEL("ios_unixcall_quit_begin") ":\n\t"
+                   "mrs x10, TPIDRRO_EL0\n\t"
+                   "and x10, x10, #~7\n\t"
+                   "adrp x11, " __ASM_NAME("ios_teb_tls_slot_offset") "@PAGE\n\t"
+                   "ldr w11, [x11, " __ASM_NAME("ios_teb_tls_slot_offset") "@PAGEOFF]\n\t"
+                   "ldr x10, [x10, x11]\n\t"
+                   "ldr w11, [x10, #0x2f0]\n\t"
+                   "cbnz w11, " __ASM_LOCAL_LABEL("ios_native_quit") "\n"
+                   __ASM_LOCAL_LABEL("ios_unixcall_quit_checked") ":\n\t"
+#endif
                    "ldr w16, [sp, #0x10c]\n\t"  /* frame->restore_flags */
                    "cbnz w16, " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n\t"
                    __ASM_CFI_CFA_IS_AT2(sp, 0x98, 0x02) /* frame->syscall_cfa */
@@ -14155,6 +14341,9 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    /* switch to user stack */
                    "mov sp, x16\n\t"
                    "ret x17\n"
+#ifdef WINE_IOS
+                   __ASM_LOCAL_LABEL("ios_unixcall_quit_end") ":\n"
+#endif
 
                    /* No table, no entry, or a code out of range: report it and
                     * return STATUS_NOT_IMPLEMENTED through the normal epilogue.

@@ -84,8 +84,23 @@ xcuserdata/
 
 # macOS
 .DS_Store
+._*
 *.swp
 *~
+
+# Local diagnostics, agent state, and interpreter/build caches.
+issue/
+app/.planning/
+app/.derived-data-log-*
+.prototype-build/
+.ruff_cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# Private device/deployment diaries, not project documentation.
+docs/MADEIRA_DEBUG_HANDOFF_2026-10-10.md
+docs/PGYER_TESTING.md
 
 # Console/crash logs (large, device-specific)
 console-log.txt

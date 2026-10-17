@@ -30,7 +30,10 @@ set -euo pipefail
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TC="$R/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin"
 export PATH="$TC:$PATH"
-B="$R/wine/build-i386"
+B="${MADEIRA_WINE_I386_BUILD_DIR:-$R/wine/build-i386}"
+DXMT_BUILD="${MADEIRA_DXMT_I386_BUILD_DIR:-$R/dxmt/build-pe-i386}"
+case "$B" in /*) ;; *) echo "MADEIRA_WINE_I386_BUILD_DIR must be absolute" >&2; exit 2 ;; esac
+case "$DXMT_BUILD" in /*) ;; *) echo "MADEIRA_DXMT_I386_BUILD_DIR must be absolute" >&2; exit 2 ;; esac
 DEST="$R/app/Madeira/i386-windows"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 8)}"
 STRIP="$TC/i686-w64-mingw32-strip"
@@ -46,7 +49,7 @@ if [ ! -f "$B/config.status" ]; then
     mkdir -p "$B"
     # --enable-winegstreamer: the PE half never touches GStreamer, but configure
     # drops the module without GStreamer's development files (docs/MEDIA.md).
-    (cd "$B" && ../configure --enable-archs=i386 --without-x --without-vulkan \
+    (cd "$B" && "$R/wine/configure" --enable-archs=i386 --without-x --without-vulkan \
                              --without-freetype --without-gnutls --disable-tests \
                              --enable-winegstreamer)
 fi
@@ -93,10 +96,11 @@ echo "== ${#TARGETS[@]} i386 modules (skipped by policy: ${#SKIP[@]} names) =="
 cd "$B"
 set +e
 make -k -j"$JOBS" "${TARGETS[@]}" > "$LOG" 2>&1
+BATCH_STATUS=$?
 set -e
 FAILED=()
 for t in "${TARGETS[@]}"; do
-    [ -f "$t" ] && continue
+    if [ "$BATCH_STATUS" -eq 0 ] && [ -f "$t" ]; then continue; fi
     if ! make -j1 "$t" >> "$LOG" 2>&1 || [ ! -f "$t" ]; then FAILED+=("$t"); fi
 done
 if [ ${#FAILED[@]} -gt 0 ]; then
@@ -105,11 +109,13 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     exit 1
 fi
 
-mkdir -p "$DEST"
+STAGE="$B/madeira-i386-stage"
+mkdir -p "$DEST" "$STAGE"
 for t in "${TARGETS[@]}"; do
     b="$(basename "$t")"
-    cp -f "$t" "$DEST/$b.tmp"
-    case "$b" in *.tlb) ;; *) "$STRIP" --strip-debug "$DEST/$b.tmp" ;; esac
+    cp -f "$t" "$STAGE/$b"
+    case "$b" in *.tlb) ;; *) "$STRIP" --strip-debug "$STAGE/$b" ;; esac
+    cp -f "$STAGE/$b" "$DEST/$b.tmp"
     mv -f "$DEST/$b.tmp" "$DEST/$b"
 done
 echo "== installed ${#TARGETS[@]} Wine modules into app/Madeira/i386-windows =="
@@ -142,20 +148,26 @@ cpu = 'i686'
 endian = 'little'
 EOF
     cd "$D"
-    if [ ! -f build-pe-i386/build.ninja ]; then
+    if [ ! -f "$DXMT_BUILD/build.ninja" ]; then
         SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" \
         meson setup --cross-file "$X" --native-file build-osx.txt --buildtype release \
-            -Dwine_build_path="$B" -Dwine_builtin_dll=true build-pe-i386
+            -Dwine_build_path="$B" -Dwine_builtin_dll=true "$DXMT_BUILD"
     fi
-    SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" meson compile -C build-pe-i386
+    SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" meson compile -C "$DXMT_BUILD" -j "$JOBS"
     for m in d3d11/d3d11.dll dxgi/dxgi.dll d3d10/d3d10core.dll winemetal/winemetal.dll; do
-        "$STRIP" -o "$DEST/$(basename "$m")" "build-pe-i386/src/$m"
+        "$STRIP" -o "$STAGE/$(basename "$m")" "$DXMT_BUILD/src/$m"
+        cp -f "$STAGE/$(basename "$m")" "$DEST/$(basename "$m").tmp"
+        mv -f "$DEST/$(basename "$m").tmp" "$DEST/$(basename "$m")"
     done
     # The shim is what programs load as d3d9.dll; the emulated frontend (the
     # meson target also called d3d9.dll) ships beside it as d3d9-emulated.dll.
-    "$STRIP" -o "$DEST/d3d9.dll" build-pe-i386/src/d3d9shim/d3d9shim.dll
-    "$STRIP" -o "$DEST/d3d9shim.dll" build-pe-i386/src/d3d9shim/d3d9shim.dll
-    "$STRIP" -o "$DEST/d3d9-emulated.dll" build-pe-i386/src/d3d9/d3d9.dll
+    "$STRIP" -o "$STAGE/d3d9.dll" "$DXMT_BUILD/src/d3d9shim/d3d9shim.dll"
+    "$STRIP" -o "$STAGE/d3d9shim.dll" "$DXMT_BUILD/src/d3d9shim/d3d9shim.dll"
+    "$STRIP" -o "$STAGE/d3d9-emulated.dll" "$DXMT_BUILD/src/d3d9/d3d9.dll"
+    for m in d3d9.dll d3d9shim.dll d3d9-emulated.dll; do
+        cp -f "$STAGE/$m" "$DEST/$m.tmp"
+        mv -f "$DEST/$m.tmp" "$DEST/$m"
+    done
     echo "== installed DXMT i386 d3d11/dxgi/d3d10core/winemetal and d3d9 (shim + emulated) =="
 fi
 
@@ -166,11 +178,13 @@ missing=0
 present="$(ls "$DEST" | tr '[:upper:]' '[:lower:]')"
 for f in "$DEST"/*; do
     case "$f" in *.tlb) continue ;; esac
+    imports="$("$OBJDUMP" -p "$f")" || { echo "invalid PE: $f" >&2; exit 1; }
     while IFS= read -r imp; do
         l="$(echo "$imp" | tr '[:upper:]' '[:lower:]')"
         case "$l" in api-ms-win-*|ext-ms-win-*) continue ;; esac
         echo "$present" | grep -qx "$l" && continue
         echo "missing import: $(basename "$f") -> $imp"; missing=$((missing + 1))
-    done < <("$OBJDUMP" -p "$f" 2>/dev/null | sed -n 's/^ *DLL Name: //p')
+    done < <(printf '%s\n' "$imports" | sed -n 's/^ *DLL Name: //p')
 done
 echo "== $(ls "$DEST" | wc -l | tr -d ' ') files in app/Madeira/i386-windows, $missing missing imports =="
+[ "$missing" -eq 0 ]

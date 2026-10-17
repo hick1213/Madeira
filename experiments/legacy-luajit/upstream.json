@@ -1,0 +1,8 @@
+{
+  "origin": "https://github.com/LuaJIT/LuaJIT.git",
+  "commit": "69e5342eb893815b18a1ec84ba74b0e0d1cc9beb",
+  "version": "LuaJIT2.0.4",
+  "archive_sha256": "5f791711adc30c2f773d2c796d489c9a76334c9c6f53833013810cd9ce98046f",
+  "source": "experiments/legacy-luajit/upstream",
+  "files": 197
+}

@@ -6,6 +6,8 @@
 #   build/wine-pe/build-modules.sh                  the default list below
 #   build/wine-pe/build-modules.sh kernelbase ...   these modules instead
 #   DEST=/some/dir build/wine-pe/build-modules.sh   install somewhere else
+#   MADEIRA_WINE_PE_BUILD_DIR=/apfs/build build/wine-pe/build-modules.sh
+#                                                 use another build directory
 #
 # A module is named by its directory under wine/dlls; the file is <name>.dll
 # unless the name has its own extension (winecoreaudio.drv). The default list
@@ -18,6 +20,9 @@
 #                                  delay-loads SystemFunction032 from it
 #   xaudio2_7                      the prefix registers CLSID_XAudio2 (2.7) at
 #                                  system32\xaudio2_7.dll
+#   xaudio2_8, xaudio2_9            modern XAudio2 imports use these versions
+#   wintypes                       WinRT API-set provider used by IL2CPP games
+#   faultrep                       fault reporting imports used by SOTTR
 # Pass the tracked modules a change touches (kernelbase, shell32, xinput1_1 ...
 # xinput1_4, ...) to rebuild them. ntdll is padded as well: build-ntdll.sh.
 #
@@ -32,7 +37,7 @@ if command -v brew >/dev/null 2>&1; then
     BISON_BIN="$(brew --prefix bison 2>/dev/null)/bin"
     [ -x "$BISON_BIN/bison" ] && export PATH="$BISON_BIN:$PATH"
 fi
-B="$R/wine/build-arm64ec"
+B="${MADEIRA_WINE_PE_BUILD_DIR:-$R/wine/build-arm64ec}"
 DEST="${DEST:-$R/app/Madeira/arm64ec-windows}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 8)}"
 STRIP="$TC/arm64ec-w64-mingw32-strip"
@@ -40,7 +45,7 @@ STRIP="$TC/arm64ec-w64-mingw32-strip"
 case "${1:-}" in
     -h|--help) sed -n '2,/^set -eu/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
 esac
-[ $# -gt 0 ] || set -- cryptsp d3dx11_43 msvcp110 msvcr110 xaudio2_7
+[ $# -gt 0 ] || set -- cryptsp d3dx11_43 faultrep msvcp110 msvcr110 xaudio2_7 xaudio2_8 xaudio2_9 wintypes
 [ -x "$STRIP" ] || { echo "llvm-mingw not found at $TC (docs/BUILDING.md)" >&2; exit 1; }
 
 targets=()
@@ -58,7 +63,7 @@ for m in "$@"; do
 done
 
 if [ ! -f "$B/config.status" ]; then
-    mkdir -p "$B" && (cd "$B" && ../configure --enable-archs=arm64ec --without-x --disable-tests --enable-winegstreamer)
+    mkdir -p "$B" && (cd "$B" && "$R/wine/configure" --enable-archs=arm64ec --without-x --disable-tests --enable-winegstreamer)
 fi
 # widl looks for stdole2.tlb under aarch64-windows/ when it builds an ARM64EC
 # typelib import (shell32 and others); this tree builds it into arm64ec-windows/.
@@ -70,11 +75,33 @@ mkdir -p "$B/dlls/stdole2.tlb"
 # unix side (winegstreamer's needs GStreamer, see build-ntdll.sh).
 make -C "$B" -j"$JOBS" "${targets[@]}"
 
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/madeira-wine-pe.XXXXXXXX")"
+TEMP_OUT=""
+cleanup() {
+    [ -z "$TEMP_OUT" ] || rm -f -- "$TEMP_OUT"
+    rm -rf -- "$SCRATCH"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Strip only on APFS: rewriting a PE directly on exFAT can lose mapped bytes.
+scratch_device="$(df -P "$SCRATCH" | awk 'NR == 2 { print $1 }')"
+diskutil info -plist "$scratch_device" > "$SCRATCH/volume.plist"
+scratch_fs="$(/usr/libexec/PlistBuddy -c 'Print :FilesystemType' "$SCRATCH/volume.plist")"
+[ "$scratch_fs" = apfs ] || { echo "TMPDIR must point to an APFS volume for PE stripping" >&2; exit 1; }
+for t in "${targets[@]}"; do
+    staged="$SCRATCH/$(basename "$t")"
+    cp "$B/$t" "$staged"
+    "$STRIP" --strip-debug "$staged"
+done
+
 mkdir -p "$DEST"
 for t in "${targets[@]}"; do
     out="$DEST/$(basename "$t")"
-    cp "$B/$t" "$out.tmp"
-    "$STRIP" --strip-debug "$out.tmp"
-    mv "$out.tmp" "$out"
+    TEMP_OUT="$(mktemp "$DEST/.$(basename "$t").XXXXXXXX")"
+    cp "$SCRATCH/$(basename "$t")" "$TEMP_OUT"
+    mv -f "$TEMP_OUT" "$out"
+    TEMP_OUT=""
     ls -l "$out"
 done

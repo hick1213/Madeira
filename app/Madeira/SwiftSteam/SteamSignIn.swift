@@ -86,8 +86,9 @@ enum SteamSignIn {
         if let steam = error as? SteamError, let text = steam.errorDescription { return text }
         if let url = error as? URLError {
             switch url.code {
-            case .notConnectedToInternet, .networkConnectionLost: return "No internet connection. Connect and try again."
-            case .timedOut: return "Steam did not respond in time. Try again."
+            case .notConnectedToInternet: return "No internet connection. Connect and try again."
+            case .networkConnectionLost: return "The connection to Steam sign-in was interrupted. Check your network or VPN and try again."
+            case .timedOut: return "Steam sign-in timed out. Check your network or VPN and try again."
             default: return "A network error occurred (\(url.code.rawValue)). Try again."
             }
         }

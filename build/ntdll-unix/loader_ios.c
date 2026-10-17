@@ -90,6 +90,7 @@
 #include "winternl.h"
 #include "unix_private.h"
 #include "ios_wow.h"
+#include "ios_native_lifetime.h"
 #include "wine/list.h"
 #include "wine/debug.h"
 
@@ -3039,7 +3040,12 @@ static void start_main_thread(void)
     set_load_order_app_name( main_wargv[0] );
     WINE_IOS_LOG("init_thread_stack...");
     init_thread_stack( teb, 0, 0, 0 );
-    NtCreateKeyedEvent( &keyed_event, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
+    {
+        extern NTSTATUS ios_register_parent_keyed_event( HANDLE, NTSTATUS );
+        NTSTATUS status = NtCreateKeyedEvent( &keyed_event, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
+        status = ios_register_parent_keyed_event( keyed_event, status );
+        if (status) process_exit_wrapper( status );
+    }
     /* ml756: take FEX's host arena BEFORE any PE module is placed.
      *
      * This is the whole point of the placeholder: once guest DLLs start
@@ -3665,6 +3671,8 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
     child_peb->TlsBitmapBits[1] = 0;
     /* Point child's TEB to the new PEB */
     teb->Peb = child_peb;
+    if (!ios_native_bind_current( child_peb ))
+        CHILD_BOOT_FAIL( "native process admission closed before PEB binding\n" );
     /* the window now has an owner, so every later
      * ios_wow_base()/ios_wow_base_for_peb() lookup resolves through the PEB
      * (including from other threads and from NtQueryInformationProcess). */
@@ -3732,6 +3740,21 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
         /* Register with wineserver using the child's socketfd */
         CHILD_STAGE( "server_init_process_child" );
         startup_info_size = server_init_process_child( child_fd_socket );
+
+        /* The default keyed-event handle must belong to THIS server process.
+         * Its ID and connection now exist, and no child PE worker has started. */
+        CHILD_STAGE( "default-keyed-event" );
+        {
+            extern NTSTATUS ios_init_child_keyed_event(void);
+            status = ios_init_child_keyed_event();
+            if (status)
+            {
+                dprintf( STDERR_FILENO, "[Wine child] default keyed event failed: %#x\n", status );
+                ios_child_boot_unlock();
+                process_exit_wrapper( status );
+            }
+        }
+
 
         /* init_startup_info — reads startup info from wineserver, loads the
          * child's PE. It OVERWRITES the main_image_info global with the

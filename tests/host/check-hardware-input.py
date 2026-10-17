@@ -558,7 +558,8 @@ check(re.search(r'<key>UIApplicationSupportsIndirectInputEvents</key>\s*<true/>'
       'Info.plist opts into indirect input events')
 pbx = (root / 'app/Madeira.xcodeproj/project.pbxproj').read_text()
 check('HardwareInput.swift in Sources */,' in pbx and 'path = HardwareInput.swift;' in pbx, 'HardwareInput.swift is built')
-check('Winios/WiniosCursor.c in Sources */,' in pbx and 'path = "Winios/WiniosCursor.c";' in pbx,
+check('Winios/WiniosCursor.c in Sources */,' in pbx and
+      re.search(r'\bpath = "?Winios/WiniosCursor\.c"?;', pbx) is not None,
       'WiniosCursor.c is built')
 switches = ('MADEIRA_HWINPUT', 'MADEIRA_INPUT_FOCUS', 'MADEIRA_DIRECT_CURSOR', 'MADEIRA_POINTER_ABSOLUTE',
             'MADEIRA_POINTER_LOCK', 'MADEIRA_POINTER_AUTOLOCK')

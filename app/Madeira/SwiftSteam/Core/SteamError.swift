@@ -43,6 +43,7 @@ enum SteamError: LocalizedError, Equatable {
     // Content
     case manifestFetchFailed(String)
     case chunkDownloadFailed(String)
+    case contentHTTPStatus(Int)
     case decryptionFailed(String)
     case decompressionFailed
     /// A downloaded chunk could not be decoded; the value names the encoding
@@ -92,6 +93,8 @@ enum SteamError: LocalizedError, Equatable {
             return "Could not read the game's file list: \(reason)"
         case .chunkDownloadFailed(let reason):
             return "Download failed: \(reason)"
+        case .contentHTTPStatus(let status):
+            return "Download failed: Content server returned HTTP \(status)."
         case .decryptionFailed(let reason):
             return "Decryption failed: \(reason)"
         case .decompressionFailed:

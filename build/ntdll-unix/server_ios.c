@@ -140,6 +140,7 @@ static void wine_log_write(const char *fmt, ...)
 #include "wine/debug.h"
 #include "unix_private.h"
 #include "ios_wow.h"
+#include "ios_native_lifetime.h"
 #include "ddk/wdm.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(server);
@@ -178,14 +179,27 @@ sigset_t server_block_set;  /* signals to block during server calls */
 static int fd_socket = -1;
 
 #ifdef WINE_IOS
+/* IOS_DEFAULT_KEYED_STATE_BEGIN */
+struct ios_keyed_event_state
+{
+    void *peb;
+    DWORD pid;
+    HANDLE handle;
+    NTSTATUS status;
+    BOOL ready;
+};
+/* IOS_DEFAULT_KEYED_STATE_END */
+
 #define IOS_MAX_PROC_SOCKETS 64
 static struct ios_proc_socket
 {
     void *peb;      /* NULL = free slot */
     int fd;         /* this pseudo-process's master socket to wineserver */
     BOOL exiting;   /* per-process process_exiting flag */
+    struct ios_keyed_event_state keyed;
 } ios_proc_sockets[IOS_MAX_PROC_SOCKETS];
 static int ios_proc_socket_count = 0;
+static pthread_mutex_t ios_proc_socket_lock = PTHREAD_MUTEX_INITIALIZER;
 
 extern void *ios_jit_current_peb(void);
 
@@ -194,10 +208,109 @@ static int ios_proc_socket_index(void)
     void *cur = ios_jit_current_peb();
     int i, n = ios_proc_socket_count;
     if (cur)
-        for (i = 0; i < n; i++)
+        for (i = 0; i < n && i < IOS_MAX_PROC_SOCKETS; i++)
             if (ios_proc_sockets[i].peb == cur) return i;
     return -1;
 }
+
+/* IOS_DEFAULT_KEYED_HELPERS_BEGIN */
+/* A server handle belongs to a Wine process, not the shared Mach task. The
+ * upstream keyed_event global is only the initial process's default object.
+ * Children initialize their own object before entering PE code; all their
+ * threads resolve it through the same PEB and server PID. No lazy creation in
+ * a wait path, and no parent fallback for an unknown or exited child. */
+static struct ios_keyed_event_state ios_parent_keyed_event;
+static pthread_mutex_t ios_keyed_event_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static DWORD ios_keyed_event_current_pid(void)
+{
+    TEB *teb = NtCurrentTeb();
+    return teb ? (DWORD)(ULONG_PTR)teb->ClientId.UniqueProcess : 0;
+}
+
+NTSTATUS ios_register_parent_keyed_event( HANDLE handle, NTSTATUS status )
+{
+    sigset_t previous;
+    pthread_sigmask( SIG_BLOCK, &server_block_set, &previous );
+    pthread_mutex_lock( &ios_keyed_event_lock );
+    ios_parent_keyed_event.peb = ios_jit_current_peb();
+    ios_parent_keyed_event.pid = ios_keyed_event_current_pid();
+    ios_parent_keyed_event.handle = handle;
+    ios_parent_keyed_event.status = status ? status :
+        (handle && ios_parent_keyed_event.peb && ios_parent_keyed_event.pid
+         ? STATUS_SUCCESS : STATUS_INVALID_HANDLE);
+    ios_parent_keyed_event.ready = TRUE;
+    status = ios_parent_keyed_event.status;
+    pthread_mutex_unlock( &ios_keyed_event_lock );
+    pthread_sigmask( SIG_SETMASK, &previous, NULL );
+    return status;
+}
+
+NTSTATUS ios_init_child_keyed_event(void)
+{
+    int i = ios_proc_socket_index();
+    NTSTATUS status;
+    struct ios_keyed_event_state *state;
+    sigset_t previous;
+
+    if (i < 0 || !ios_keyed_event_current_pid()) return STATUS_INVALID_HANDLE;
+    pthread_sigmask( SIG_BLOCK, &server_block_set, &previous );
+    pthread_mutex_lock( &ios_keyed_event_lock );
+    state = &ios_proc_sockets[i].keyed;
+    if (!state->ready)
+    {
+        HANDLE handle = NULL;
+        status = NtCreateKeyedEvent( &handle, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
+        state->peb = ios_jit_current_peb();
+        state->pid = ios_keyed_event_current_pid();
+        state->handle = status ? NULL : handle;
+        state->status = status ? status : (handle ? STATUS_SUCCESS : STATUS_INVALID_HANDLE);
+        state->ready = TRUE;
+    }
+    status = state->peb == ios_jit_current_peb() && state->pid == ios_keyed_event_current_pid()
+             ? state->status : STATUS_INVALID_HANDLE;
+    pthread_mutex_unlock( &ios_keyed_event_lock );
+    pthread_sigmask( SIG_SETMASK, &previous, NULL );
+    return status;
+}
+
+NTSTATUS ios_default_keyed_event( HANDLE *handle )
+{
+    int i = ios_proc_socket_index();
+    NTSTATUS status = STATUS_INVALID_HANDLE;
+    const struct ios_keyed_event_state *state;
+    void *cur = ios_jit_current_peb();
+    DWORD pid = ios_keyed_event_current_pid();
+    sigset_t previous;
+
+    *handle = NULL;
+    /* A termination signal must not strand this shared mutex. Restoring the
+     * caller's mask after unlocking also preserves outer protected sections. */
+    pthread_sigmask( SIG_BLOCK, &server_block_set, &previous );
+    pthread_mutex_lock( &ios_keyed_event_lock );
+    state = i >= 0 ? &ios_proc_sockets[i].keyed : &ios_parent_keyed_event;
+    if (cur && pid && state->ready && state->peb == cur && state->pid == pid)
+    {
+        status = state->status;
+        if (!status) *handle = state->handle;
+    }
+    pthread_mutex_unlock( &ios_keyed_event_lock );
+    pthread_sigmask( SIG_SETMASK, &previous, NULL );
+    return status;
+}
+
+static void ios_release_child_keyed_event( int i )
+{
+    sigset_t previous;
+    pthread_sigmask( SIG_BLOCK, &server_block_set, &previous );
+    pthread_mutex_lock( &ios_keyed_event_lock );
+    memset( &ios_proc_sockets[i].keyed, 0, sizeof(ios_proc_sockets[i].keyed) );
+    pthread_mutex_unlock( &ios_keyed_event_lock );
+    pthread_sigmask( SIG_SETMASK, &previous, NULL );
+    /* The process's server EOF releases its handles. Do not NtClose through
+     * a disconnected (or another process's) server connection here. */
+}
+/* IOS_DEFAULT_KEYED_HELPERS_END */
 
 /* Master socket for the CURRENT thread's pseudo-process (parent = global). */
 static int ios_current_fd_socket(void)
@@ -282,6 +395,7 @@ void ios_fdt_mark_closed( int fd )
 static void ios_fdt_note_close( int fd, const char *why, void *dead_peb )
 {
     struct ios_fdt_ent *e;
+    unsigned int closer_tid = NtCurrentTeb() ? (unsigned int)GetCurrentThreadId() : 0;
     if (fd < 0 || fd >= IOS_FDT_MAX) return;
     e = &ios_fdt[fd];
     if (e->kind && e->kind != FDT_CLOSED)
@@ -289,14 +403,14 @@ static void ios_fdt_note_close( int fd, const char *why, void *dead_peb )
         int cross = (e->peb != dead_peb);
         wine_log_write("[fdtrace]%s close fd=%d why=%s kind=%s owner_tid=%04x owner_peb=%p gen=%u closer_tid=%04x dead_peb=%p rev=ml586",
                        cross ? " CROSS!" : "", fd, why, ios_fdt_names[e->kind],
-                       e->tid, e->peb, e->gen, (unsigned int)GetCurrentThreadId(), dead_peb);
+                       e->tid, e->peb, e->gen, closer_tid, dead_peb);
         e->prev_kind = e->kind;
         e->kind = FDT_CLOSED;
     }
     else
         wine_log_write("[fdtrace] close fd=%d why=%s untracked%s closer_tid=%04x dead_peb=%p rev=ml586",
                        fd, why, (e->kind == FDT_CLOSED) ? " (prev comm fd)" : "",
-                       (unsigned int)GetCurrentThreadId(), dead_peb);
+                       closer_tid, dead_peb);
 }
 
 /* victim autopsy: what the ledger knows about a failing comm fd */
@@ -311,9 +425,13 @@ static void ios_fdt_autopsy( const char *what, int fd, int ret, int err )
 
 static void ios_register_proc_socket(void *peb_id, int fd)
 {
-    int idx = __sync_fetch_and_add(&ios_proc_socket_count, 1);
+    int idx;
+    pthread_mutex_lock( &ios_proc_socket_lock );
+    for (idx = 0; idx < ios_proc_socket_count && idx < IOS_MAX_PROC_SOCKETS; idx++)
+        if (!ios_proc_sockets[idx].peb) break;
     if (idx >= IOS_MAX_PROC_SOCKETS)
     {
+        pthread_mutex_unlock( &ios_proc_socket_lock );
         wine_log_write("[Wine child] proc-socket table FULL (%d)!", idx);
         return;
     }
@@ -322,6 +440,8 @@ static void ios_register_proc_socket(void *peb_id, int fd)
     ios_proc_sockets[idx].exiting = FALSE;
     __sync_synchronize();
     ios_proc_sockets[idx].peb = peb_id;
+    if (idx == ios_proc_socket_count) ios_proc_socket_count++;
+    pthread_mutex_unlock( &ios_proc_socket_lock );
 }
 #endif
 static _Thread_local int initial_cwd = -1;
@@ -1581,9 +1701,9 @@ static void ios_xprobe_main( void )
             gettimeofday( &tv, NULL ); localtime_r( &tv.tv_sec, &tmv );
             snprintf( wall, sizeof(wall), "%02d:%02d:%02d.%03d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (int)(tv.tv_usec / 1000) );
             n = snprintf( line, sizeof(line),
-                          "[xp] %s +%.2f dt=%.0f cpu=%.0f (thr %.0f) P=%.0f E=%.0f run=%.0f pgw=%.1f GHz P=%.2f E=%.2f Minst=%.0f IPC=%.2f mJ=%.0f pin=%llu rdKB=%llu fpMB=%llu",
+                          "[xp] %s +%.2f dt=%.0f cpu=%.0f (thr %.0f) P=%.0f E=%.0f run=%.0f GHz P=%.2f E=%.2f Minst=%.0f IPC=%.2f mJ=%.0f pin=%llu rdKB=%llu fpMB=%llu",
                           wall, XP_MS( now - t_start ) / 1000.0, dt_ms, cpu, sum_thr_ms, pms, ems,
-                          XP_MS( ru.ri_runnable_time - pru.ri_runnable_time ), XP_MS( ru.ri_page_wait_time_mach - pru.ri_page_wait_time_mach ),
+                          XP_MS( ru.ri_runnable_time - pru.ri_runnable_time ),
                           pms > 0 ? pcy / (pms * 1e6) : 0, ems > 0 ? (cy - pcy) / (ems * 1e6) : 0, ins / 1e6, cy > 0 ? ins / cy : 0,
                           (double)(ru.ri_energy_nj - pru.ri_energy_nj) / 1e6,
                           (unsigned long long)(ru.ri_pageins - pru.ri_pageins), (unsigned long long)((ru.ri_diskio_bytesread - pru.ri_diskio_bytesread) >> 10),
@@ -3001,6 +3121,37 @@ void ios_fd_cache_release( void *peb )
              "skipped FD_TYPE_INVALID; munmap for secondary blocks)\n", peb, closed );
 }
 
+/* The native observer calls this only after owned threads and callback leases
+ * drain. It also covers bootstrap pthread_exit, which skips logical ExitProcess.
+ * Keep a closed child's identity until this point: a laggard lookup must get
+ * its closed fd, not fall back to the initial process's live socket. */
+void ios_server_finish_process( void *peb_id, int initial )
+{
+    int i, found = 0;
+    pthread_mutex_lock( &ios_proc_socket_lock );
+    for (i = 0; i < ios_proc_socket_count && i < IOS_MAX_PROC_SOCKETS; i++)
+    {
+        if (!peb_id || ios_proc_sockets[i].peb != peb_id) continue;
+        if (ios_proc_sockets[i].fd >= 0)
+        {
+            ios_fdt_note_close( ios_proc_sockets[i].fd, "native-complete", peb_id );
+            close( ios_proc_sockets[i].fd );
+            ios_proc_sockets[i].fd = -1;
+        }
+        ios_release_child_keyed_event( i );
+        ios_proc_sockets[i].peb = NULL;
+        found = 1;
+        break;
+    }
+    if (initial && !found && fd_socket >= 0)
+    {
+        close( fd_socket );
+        fd_socket = -1;
+    }
+    pthread_mutex_unlock( &ios_proc_socket_lock );
+    ios_fd_cache_release( peb_id );
+}
+
 #define fd_cache           (ios_get_fd_cache()->blocks)
 #define fd_cache_initial_block (ios_get_fd_cache()->initial_block)
 #else
@@ -3601,49 +3752,24 @@ void process_exit_wrapper( int status )
     int i = ios_proc_socket_index();
     if (i >= 0)
     {
-        extern void ios_jit_reclaim_process( void *peb );
-        extern void ios_retire_own_fixed_base_image( void *peb );
         void *dead_peb = ios_proc_sockets[i].peb;
+        ios_native_retire_process( dead_peb );
         wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d): closing child fd_socket=%d",
                        status, ios_proc_sockets[i].fd);
-        /* ml987: hand back the fixed-base main image BEFORE the socket closes.
-         * NtUnmapViewOfSection needs a live server connection, and this is the
-         * last moment we have one while still on the owning process's thread. */
-        ios_retire_own_fixed_base_image( dead_peb );
-        ios_fdt_note_close( ios_proc_sockets[i].fd, "exit-master", dead_peb );
-        close( ios_proc_sockets[i].fd );
-        ios_proc_sockets[i].peb = NULL;
-        /* ml571: drop this pseudo-process's fd cache and close what it held.
-         * Must happen on the SAME identity used to key it, and before the JIT
-         * reclaim below reuses anything. */
+        /* Native workers and TLS destructors can still execute after this
+         * logical exit. The lifetime observer performs image/pool/window
+         * retirement after every retained endpoint of this generation dies. */
+        pthread_mutex_lock( &ios_proc_socket_lock );
+        if (ios_proc_sockets[i].peb == dead_peb && ios_proc_sockets[i].fd >= 0)
         {
-            extern void ios_fd_cache_release( void *peb );
-            ios_fd_cache_release( dead_peb );
+            ios_fdt_note_close( ios_proc_sockets[i].fd, "exit-master", dead_peb );
+            ios_release_child_keyed_event( i );
+            close( ios_proc_sockets[i].fd );
+            ios_proc_sockets[i].fd = -1;
         }
-        {   /* ml1205: its ml938 sub-floor windows go with it */
-            extern void ios_subfloor_release_owner( void *owner );
-            ios_subfloor_release_owner( dead_peb );
-        }
-        /* Task #25: release this pseudo-process's JIT pool allocations
-         * (module copies, trampolines, FEX CodeBuffers). Children only —
-         * the session (else-branch) lives as long as the app. Reuse is
-         * grace-delayed inside the allocator for laggard exit threads. */
-        ios_jit_reclaim_process( dead_peb );
-        /* and its guest window, if it had one.  Here rather
-         * than only in ios_child_thread_entry because THIS is the chokepoint
-         * every pseudo-process exit reaches, on whichever thread called
-         * ExitProcess — a guest worker thread that ends the process does not
-         * return to the boot thread's setjmp at all.  Keyed by the dying PEB,
-         * not by the calling thread.  Nothing is unmapped here; see
-         * ios_wow_window_mark_released(). */
-        ios_wow_window_release( dead_peb );
-        /* ml988 phase 2: only now may the retired fixed base be handed on. Until
-         * this point the old generation's pool mappings and FEX translations are
-         * still live, so a new claimant taking the same VA would race them. */
-        {
-            extern void ios_exe_win_mark_ready( void *peb );
-            ios_exe_win_mark_ready( dead_peb );
-        }
+        pthread_mutex_unlock( &ios_proc_socket_lock );
+        /* Keep identity and cache storage until native quiescence. A sibling
+         * can still be unwinding a lookup after this Windows process exited. */
     }
     else
     {
@@ -3654,7 +3780,10 @@ void process_exit_wrapper( int status )
          * helpers and anything the program starts have a slot and never call it. */
         extern void wine_launched_process_did_exit( int status ) __attribute__((weak));
         if (wine_launched_process_did_exit) wine_launched_process_did_exit( status );
-        close( fd_socket );
+        if (NtCurrentTeb()) ios_native_retire_process( NtCurrentTeb()->Peb );
+        pthread_mutex_lock( &ios_proc_socket_lock );
+        if (fd_socket >= 0) { close( fd_socket ); fd_socket = -1; }
+        pthread_mutex_unlock( &ios_proc_socket_lock );
     }
 #else
     close( fd_socket );

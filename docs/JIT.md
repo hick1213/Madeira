@@ -94,6 +94,18 @@ only the Local Network permission is needed.
    and verifies the matching Developer Disk Image when needed.
 3. Tap **Enable JIT**.
 
+The Remote Pairing service can move away from its default port, `49152`.
+Madeira looks up `_remotepairing._tcp` before Check setup and Enable JIT, verifies
+the advertised peer against this pairing record's `alt_irk`, and passes that
+port to its helper. Connections still use LocalDevVPN's `10.7.0.1`, rather than
+the advertised LAN address. A lookup lasts up to four seconds; without a
+matching advertisement, or with an older record without the IRK, it uses the
+original default port. Keep the device unlocked and Wi-Fi on during setup.
+
+A successful lockdownd check at `62078` does not establish that Remote Pairing
+is reachable. If the latter fails after lockdownd answered, Madeira preserves
+the actual service error instead of reporting that LocalDevVPN is disconnected.
+
 Either way, the pairing file is kept in the Keychain, for this device only and
 readable while it is unlocked, as the Steam sign-in token is. It is a credential
 for the iPhone itself, so it is never stored in `Documents`, where the Files app

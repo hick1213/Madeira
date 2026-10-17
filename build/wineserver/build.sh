@@ -11,16 +11,13 @@ SHIMS_DIR="$REPO_ROOT/build/ntdll-unix/shims"
 # Object files and library go in build dir
 OBJ_DIR="$BUILD_DIR/obj"
 mkdir -p "$OBJ_DIR"
+WORK_ARCHIVE="$OBJ_DIR/libwineserver.a"
 
-# Copy the base library if we don't have one yet
-if [ ! -f "$OBJ_DIR/libwineserver.a" ]; then
-    if [ -f "$APP_LIB" ]; then
-        cp "$APP_LIB" "$OBJ_DIR/libwineserver.a"
-    else
-        echo "ERROR: No base libwineserver.a found"
-        exit 1
-    fi
-fi
+[ -s "$WINE_SRC/build-macos/include/config.h" ] || \
+    { echo "ERROR: missing Wine config; configure wine/build-macos with --enable-archs=none and run make include/all (bison >= 3)" >&2; exit 1; }
+OBJCOPY="${LLVM_OBJCOPY:-$(command -v llvm-objcopy || true)}"
+[ -n "$OBJCOPY" ] || OBJCOPY="$REPO_ROOT/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/llvm-objcopy"
+[ -x "$OBJCOPY" ] || { echo "ERROR: missing llvm-objcopy; install the pinned llvm-mingw toolchain or set LLVM_OBJCOPY" >&2; exit 1; }
 
 CC_FLAGS=(
     -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 -O2
@@ -113,6 +110,16 @@ PATCHED_FILES=(
     "hidparse_ios:$REPO_ROOT/build/hidpad/hidparse_ios.c:hidparse_ios.o"
 )
 
+if [ ! -s "$OBJ_DIR/libwineserver.a" ]; then
+    if [ -s "$APP_LIB" ]; then
+        cp "$APP_LIB" "$OBJ_DIR/libwineserver.a"
+    else
+        [ "${1:-all}" = all ] || { echo "ERROR: first build must use all" >&2; exit 1; }
+        source "$BUILD_DIR/bootstrap-base.sh"
+        bootstrap_wineserver_base
+    fi
+fi
+
 echo "=== Building kill wrapper (without kill macro) ==="
 echo -n "  wineserver_ios_kill... "
 # Compile WITHOUT -include wineserver_ios_kill.h to avoid recursive macro
@@ -194,9 +201,9 @@ for entry in "${REPLACEMENTS[@]}"; do
     new_obj="${entry%%:*}"
     old_obj="${entry##*:}"
     if [ -f "$OBJ_DIR/$new_obj" ]; then
-        ar d "$OBJ_DIR/libwineserver.a" "$old_obj" 2>/dev/null || true
-        ar d "$OBJ_DIR/libwineserver.a" "$new_obj" 2>/dev/null || true
-        ar r "$OBJ_DIR/libwineserver.a" "$OBJ_DIR/$new_obj"
+        ar d "$WORK_ARCHIVE" "$old_obj" 2>/dev/null || true
+        ar d "$WORK_ARCHIVE" "$new_obj" 2>/dev/null || true
+        ar r "$WORK_ARCHIVE" "$OBJ_DIR/$new_obj"
     fi
 done
 
@@ -206,8 +213,6 @@ echo "=== Renaming colliding symbols in every .o (objcopy sweep) ==="
 # we know collide with win32u-unix, repackage. Affects definitions AND
 # references uniformly, so cross-file calls inside wineserver still
 # resolve. Externals (win32u, etc.) only see the ws_-prefixed names.
-OBJCOPY=$(command -v llvm-objcopy || echo /opt/homebrew/opt/llvm/bin/llvm-objcopy)
-[ -x "$OBJCOPY" ] || OBJCOPY=/opt/homebrew/Cellar/llvm/22.1.0/bin/llvm-objcopy
 COLLISIONS=(
     alloc_user_handle free_user_handle get_virtual_screen_rect
     destroy_thread_windows get_window_thread is_desktop_class
@@ -240,12 +245,20 @@ for s in "${COLLISIONS[@]}"; do
 done
 TMP_RENAME_DIR="$OBJ_DIR/rename"
 rm -rf "$TMP_RENAME_DIR" && mkdir -p "$TMP_RENAME_DIR"
-(cd "$TMP_RENAME_DIR" && ar x "$OBJ_DIR/libwineserver.a")
+(cd "$TMP_RENAME_DIR" && ar x "$WORK_ARCHIVE")
 for f in "$TMP_RENAME_DIR"/*.o; do
     "$OBJCOPY" "${RENAME_ARGS[@]}" "$f"
 done
-rm "$OBJ_DIR/libwineserver.a"
-ar rcs "$OBJ_DIR/libwineserver.a" "$TMP_RENAME_DIR"/*.o
+ar rcs "$TMP_RENAME_DIR/libwineserver.a" "$TMP_RENAME_DIR"/*.o
+symbols=$(nm -g "$TMP_RENAME_DIR/libwineserver.a")
+for s in "${COLLISIONS[@]}"; do
+    if printf '%s\n' "$symbols" | awk '{print $NF}' | grep -Fxq "_$s"; then
+        echo "ERROR: symbol rename left _$s in wineserver" >&2
+        exit 1
+    fi
+done
+mv "$TMP_RENAME_DIR/libwineserver.a" "$OBJ_DIR/libwineserver.a"
+[ "$WORK_ARCHIVE" = "$OBJ_DIR/libwineserver.a" ] || rm -f "$WORK_ARCHIVE"
 rm -rf "$TMP_RENAME_DIR"
 echo "  symbol rename + repack OK"
 

@@ -106,6 +106,7 @@ and some inputs that are not in the repository, such as the toolchains.
 | StikDebug and built-in JIT setup | [`docs/JIT.md`](docs/JIT.md) |
 | The game library | [`docs/LIBRARY.md`](docs/LIBRARY.md) |
 | Steam sign-in, library and downloads | [`docs/STEAM_SIGNIN.md`](docs/STEAM_SIGNIN.md), [`docs/STEAM_LIBRARY.md`](docs/STEAM_LIBRARY.md) |
+| Epic Games sign-in, library, downloads and game launch | [`docs/EPIC_GAMES.md`](docs/EPIC_GAMES.md) |
 | Steam Cloud saves | [`docs/STEAM_CLOUD.md`](docs/STEAM_CLOUD.md) |
 | Madeira Dock (the Steam client) | [`docs/MADEIRA_DOCK.md`](docs/MADEIRA_DOCK.md) |
 | 32-bit games (WoW64) | [`docs/WOW64.md`](docs/WOW64.md) |
@@ -113,6 +114,9 @@ and some inputs that are not in the repository, such as the toolchains.
 | Keyboard, mouse and trackpad | [`docs/KEYBOARD_MOUSE.md`](docs/KEYBOARD_MOUSE.md) |
 | Audio and video | [`docs/MEDIA.md`](docs/MEDIA.md) |
 | Licensing in detail | [`docs/LICENSING.md`](docs/LICENSING.md) |
+
+Shared-runtime checks and future-game investigation directions are documented
+in [Compatibility probes](docs/COMPATIBILITY_PROBES.md).
 
 ## Licensing
 

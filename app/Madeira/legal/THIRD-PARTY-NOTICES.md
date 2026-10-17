@@ -10,9 +10,16 @@ dependency license texts are in `LICENSES/`. See "Why GPL-3.0-or-later" below.
 
 ## Components that ship in the built app
 
+The bundled **Noto Sans CJK SC Regular 2.004** font is unmodified, copyright
+2014–2021 Adobe, and licensed under SIL Open Font License 1.1. Source:
+https://github.com/notofonts/noto-cjk/tree/Sans2.004/Sans/OTF/SimplifiedChinese.
+The font and full license are bundled in `cjk-fonts/`. It supplies missing Chinese
+glyphs through Wine's font fallback; it does not replace the user's Latin fonts.
+
 | Component | Upstream license | **Madeira's fork** | Notes |
 |---|---|---|---|
 | **Wine** | LGPL-2.1-or-later | **GPL-3.0-or-later** | Fork relicensed under LGPL-2.1 §3, which expressly permits applying the ordinary GPL to a copy. `ntdll`, `wineserver`, `win32u`, ARM64EC loader modified for iOS. |
+| **FAudio** 26.2.0, bundled by Wine | zlib | Unmodified, statically linked into Wine's XAudio2 providers | Supplies Wine's ARM64EC `xaudio2_7.dll`, `xaudio2_8.dll` and `xaudio2_9.dll` audio implementation. Source: `wine/libs/faudio` at Wine commit `257f271cfffed9f22f7987cac53bc00095d092fe`; license text: `LICENSES/FAudio-zlib.txt` (also bundled under `legal/LICENSES`). These are separate from the FAudio included in Wine Mono. |
 | **FEX-Emu** | MIT | upstream MIT + **modifications GPL-3.0-or-later** | Forked. x86-64 → ARM64 translation. |
 | **DXMT** | MIT | upstream MIT + **modifications GPL-3.0-or-later** | Forked. D3D11 → Metal. |
 | **DXMT — Direct3D 9 / DXSO frontend** | **LGPL-2.1-or-later** | **LGPL-2.1-or-later**, kept as received | Written by **David Acevedo** (his commit `fe69cd3`, "feat(d3d9): add a Direct3D 9 frontend") and imported into `dxmt` from his fork of the same upstream: `https://github.com/dacevedo12/dxmt.git`, tag `v0.4-d3d9`, commit `e8dd4c656dcb74a6d970a30a397d1558b0e3fb2b`. That tree's licence is the DXMT project notice ("Copyright (c) 2023-2026 Feifan He for CodeWeavers", LGPL-2.1-or-later), which postdates upstream's MIT→LGPL relicense, so the import is **not** MIT. It is kept under LGPL-2.1-or-later as received: the LGPL-2.1 §3 option to distribute a copy under the ordinary GPL is not exercised, and that choice is left to the maintainer. 125hz's additions to the D3D9 path are licensed like the DXMT row. Licence text in `dxmt/COPYING.LIB` and `LICENSES/LGPL-2.1.txt`; the file-by-file list is in `dxmt/LICENSE-MADEIRA.md`. |
@@ -27,13 +34,15 @@ dependency license texts are in `LICENSES/`. See "Why GPL-3.0-or-later" below.
 | **Berkeley SoftFloat 3e** | BSD-3-Clause | Static (`libsoftfloat_3e.a`), via FEX. |
 | **Steam sign-in, owned library and downloads (`app/Madeira/SwiftSteam/`)** | Derived from Jfishin's Madeira Steam client, used with the author's permission (see below); Jfishin confirmed that he wrote the depot downloader himself | GPL-3.0-or-later + Converter Exception, Copyright 2026 Jfishin, 125hz | Sign-in to Steam's public `IAuthenticationService` over HTTPS and a Keychain token store; a Steam connection (WebSocket over TLS) that lists the account's owned games; downloads from Steam's content servers into Madeira Dock's Steam library folder. File-by-file provenance and the licence audit of the downloader: `docs/STEAM_SIGNIN.md`, `docs/STEAM_LIBRARY.md`. No Valve or third-party Steam code or binaries, and no Steam Cloud, launch-emulator or DRM code. |
 | **Zstandard educational decoder** | BSD-3-Clause or GPL-2.0 | BSD-3-Clause selected | `app/Madeira/SwiftSteam/zstd_edu.c/.h` (Meta Platforms). Decodes Steam's zstd content chunks. Madeira's error-recovery wrapper (Jfishin's, kept) is serialized across threads. Licence text in `LICENSES/ZSTD-BSD.txt`. |
+| **Epic Games sign-in, owned library and downloads (`app/Madeira/Epic*.swift`)** | Original Madeira implementation | **GPL-3.0-or-later** | Native Swift implementation of the Launcher protocol, with protocol references to [Legendary](https://github.com/legendary-gl/legendary) and [Heroic](https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher). No Legendary Python, Heroic Electron application or Epic Games Launcher binaries are embedded. Public Launcher OAuth client identifiers are protocol metadata, not a user's credentials or a private Madeira application key. No Converter Exception is asserted for this implementation. Usage and limitations: `docs/EPIC_GAMES.md`. |
 | **liblzma** | Public domain / 0BSD | System library | Linked dynamically from the iOS SDK (`liblzma.tbd`) for Steam's LZMA content chunks; nothing is bundled. |
 | **Madeira Dock (`madeira-dock`, built into `arm64ec-windows/dockhost.exe`)** | original work, Copyright 2026 125hz | GPL-3.0-or-later + Converter Exception | Headless host for Valve's Steam client, a separate Windows program started in the Wine session. Built from the submodule by `build/madeira-dock/build.sh`; not committed as a binary. Its statically linked LLVM/MinGW-w64 runtime notices ship in `dock-notices.txt`. Valve's client files are downloaded by the user from Valve and are not covered by Madeira's licence. See `docs/MADEIRA_DOCK.md`. |
-| **StikJIT** 1.9.0 | MPL-2.0 | Bundled XCFramework in the iOS 26 JIT helper | Enables JIT for Madeira through the device's RSD tunnel. Exact corresponding source: [`StikDebug/StikJIT` tag `1.9.0`](https://github.com/StikDebug/StikJIT/tree/1.9.0); bundled license text: `LICENSE-StikJIT-MPL-2.0.txt`. The framework contains **idevice**, Copyright 2026 Jackson Coxson, under MIT; source: [`jkcoxson/idevice`](https://github.com/jkcoxson/idevice), bundled license text: `LICENSE-idevice-MIT.txt`. |
-| **On-device pairing** (`libmadeira_rppairing.a`) | **idevice** 0.1.68, Copyright 2026 Jackson Coxson, MIT; its Rust dependencies under MIT, Apache-2.0, BSD-3-Clause or ISC | Madeira's wrapper (`build/rppairing-ios`) **GPL-3.0-or-later**; dependencies unmodified, static in the app | iOS 27 on-device remote pairing for Built-in StikJIT (`app/Madeira/JITPairing.swift`, docs/JIT.md). Built from crates.io at the versions pinned in `build/rppairing-ios/Cargo.lock`. Every crate in the binary, with its licence files, is listed in `LICENSES-rppairing-crates.txt`, regenerated by `build/rppairing-ios/build.sh`. idevice's licence text: `LICENSE-idevice-MIT.txt`. |
+| **StikJIT** 1.9.0 | MPL-2.0 | Bundled XCFramework in the iOS 26 JIT helper | Enables JIT for Madeira through the device's RSD tunnel. Exact corresponding source: [`StikDebug/StikJIT` tag `1.9.0`](https://github.com/StikDebug/StikJIT/tree/1.9.0); license text: `LICENSES/MPL-2.0.txt`. The framework contains **idevice**, Copyright 2026 Jackson Coxson, under MIT; source: [`jkcoxson/idevice`](https://github.com/jkcoxson/idevice), license text: `LICENSES/MIT-idevice.txt`. |
+| **On-device pairing** (`libmadeira_rppairing.a`) | **idevice** 0.1.68, Copyright 2026 Jackson Coxson, MIT; its Rust dependencies under MIT, Apache-2.0, BSD-3-Clause or ISC | Madeira's wrapper (`build/rppairing-ios`) **GPL-3.0-or-later**; dependencies unmodified, static in the app | iOS 27 on-device remote pairing for Built-in StikJIT (`app/Madeira/JITPairing.swift`, docs/JIT.md). Built from crates.io at the versions pinned in `build/rppairing-ios/Cargo.lock`. Every crate in the binary, with its licence files, is listed in `app/Madeira/legal/LICENSES-rppairing-crates.txt` (bundled as `legal/LICENSES-rppairing-crates.txt`), regenerated by `build/rppairing-ios/build.sh`. idevice's licence text: `LICENSES/MIT-idevice.txt`. |
 | **libxml2** 2.12.10 and **libxslt** 1.1.45 | MIT (Daniel Veillard and contributors) | Unmodified, statically linked into Wine's `msxml3.dll` (`arm64ec-windows`) | Wine's bundled copies (`wine/libs/xml2`, `wine/libs/xslt`), built with the module by `build/wine-pe/build-modules.sh`. Licence texts in `LICENSES/MIT-libxml2.txt` and `LICENSES/MIT-libxslt.txt`. |
 | **NVAPI SDK headers** | MIT (NVIDIA Corporation & affiliates) | Unmodified headers, compiled into DXMT's `nvapi64.dll` (`arm64ec-windows`) | `dxmt/external/nvapi`. DXMT's own NVAPI implementation answers only with Madeira's opt-in "Report an NVIDIA GPU" switch; no NVIDIA binary is shipped. Licence text in `LICENSES/MIT-NVAPI.txt`. |
 | **Wine Mono** 11.0.0 | Mono: LGPL or MIT X11 per part; FNA: Ms-PL and MIT; FAudio, FNA3D, MojoShader, SDL3: zlib; winforms, wpf, monoDX, System.Speech and Wine Mono's own code: MIT (`build/wine-mono/COPYING`) | Prebuilt runtime, unmodified except `lib/mono/4.5/mscorlib.dll` (4 IL bytes in `GC.Collect`, `build/wine-mono/bundle.sh`), bundled as `wine-mono/` with that COPYING only in a development build made after `build/wine-mono/fetch.sh`; **release builds do not include it** (the packaging step removes `wine-mono/`). Instead the app downloads it from WineHQ when the user asks (setup or Settings › .NET Framework, `app/Madeira/WineMono.swift`), checks it against the same SHA-256, unpacks it without `lib/mono/*-api` and applies the same mscorlib patch on the device | Runs .NET Framework programs; Wine's mscoree loads it. The x86 tarball from `dl.winehq.org`, SHA-256 pinned in `build/wine-mono/pin.sh`. The compile-time reference assemblies (`lib/mono/*-api`, which include the GPL-licensed ICSharpCode.SharpZipLib) are not bundled. Exact corresponding source: `wine-mono-11.0.0-src.tar.xz` from the same folder; see "Corresponding source" below. |
+| **SDL3 compatibility component** | SDL upstream commit `b1362f8a427b32e01df19b48c8dd4b6599d6cc6d`, unmodified source, independently built AMD64 | zlib; included HIDAPI under BSD; static LLVM/MinGW runtime notices | Separate signed-app resource `arm64ec-windows/madeira-steam-components/SDL3.dll`, pinned by SHA-256 and exact SDL revision. Not a Valve-distributed binary; original Steam files retained. Full notices: `madeira-steam-components/SDL3-NOTICES.txt`. |
 
 ## Why GPL-3.0-or-later
 
@@ -158,6 +167,23 @@ and the exact source they are built from is tracked here in the same way:
   every run of the build script verifies before extracting
 - `build/ffmpeg/build.sh` -- the exact build machinery and configure flags. No
   patches are applied, and the script needs no network.
+
+Wine Mono is not linked into anything: `build/wine-mono/bundle.sh` copies the
+prebuilt runtime into the bundle as files. Its source release is 372 MB, too
+large for the repository, so it is pinned rather than tracked:
+
+- `build/wine-mono/pin.sh` -- the version, and the SHA-256 of both the x86
+  tarball that is bundled and `wine-mono-11.0.0-src.tar.xz`, its source
+  (`c504cb0b91ce09b72869e063844ce114564d4ac340479a82aa6789f51510e520`)
+- `build/wine-mono/fetch.sh --source` -- downloads both from
+  `https://dl.winehq.org/wine/wine-mono/11.0.0/` and verifies them
+
+Release builds do not ship Wine Mono (decided 2026-10-06): the packaging step
+removes `wine-mono/` from the app, and Madeira fetches it from WineHQ on first
+use instead (`app/Madeira/WineMono.swift`), so the copy on a device comes from
+WineHQ, not from Madeira. A release that did ship it would have to attach that source
+tarball next to the package and add the licence texts COPYING lists to
+`LICENSES/`.
 
 ## Relinking and static linking
 

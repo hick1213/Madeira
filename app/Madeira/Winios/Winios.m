@@ -660,6 +660,70 @@ extern void winios_drv_post_key(unsigned short vk, unsigned int flags);
 extern void winios_dump_window_tree(void);
 extern void ios_dump_all_thread_stacks(void);
 
+/* DESKTOP_CONTROL_BEGIN */
+extern int winios_drv_desktop_identity(uint64_t, uintptr_t *, unsigned int *);
+extern int winios_drv_close_owned_desktop(uint64_t, uintptr_t, unsigned int);
+extern void winios_drv_reset_desktop_identity(void);
+static _Atomic uint64_t winios_control_token;
+static struct {
+    pthread_mutex_t lock;
+    uintptr_t hwnd;
+    unsigned int pid;
+    int pending, sent;
+} winios_desktop_control = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+uint64_t winios_control_session_token(void)
+{
+    return atomic_load_explicit(&winios_control_token, memory_order_acquire);
+}
+static void winios_control_reset(void)
+{
+    pthread_mutex_lock(&winios_desktop_control.lock);
+    winios_desktop_control.hwnd = 0; winios_desktop_control.pid = 0;
+    winios_desktop_control.pending = winios_desktop_control.sent = 0;
+    winios_drv_reset_desktop_identity();
+    uint64_t next = winios_control_session_token() + 1;
+    if (!next) next = 1;
+    atomic_store_explicit(&winios_control_token, next, memory_order_release);
+    pthread_mutex_unlock(&winios_desktop_control.lock);
+}
+int winios_request_desktop_close(uint64_t generation)
+{
+    int accepted = 0;
+    pthread_mutex_lock(&winios_desktop_control.lock);
+    if (generation && generation == winios_control_session_token())
+    {
+        if (!winios_desktop_control.sent) winios_desktop_control.pending = 1;
+        accepted = 1;
+    }
+    pthread_mutex_unlock(&winios_desktop_control.lock);
+    return accepted;
+}
+static int winios_control_process_events(void)
+{
+    int closed = 0;
+    pthread_mutex_lock(&winios_desktop_control.lock);
+    uint64_t generation = winios_control_session_token();
+    uintptr_t hwnd = 0; unsigned int pid = 0;
+    if (generation && winios_drv_desktop_identity(generation, &hwnd, &pid))
+    {
+        if (!winios_desktop_control.hwnd) { winios_desktop_control.hwnd = hwnd; winios_desktop_control.pid = pid; }
+        if (winios_desktop_control.pending && !winios_desktop_control.sent &&
+            winios_desktop_control.hwnd == hwnd && winios_desktop_control.pid == pid &&
+            winios_drv_close_owned_desktop(generation, hwnd, pid))
+        {
+            winios_desktop_control.pending = 0;
+            winios_desktop_control.sent = 1; closed = 1;
+        }
+    }
+    /* Keep the request pending on unknown identity or failed PostMessage.
+     * This mailbox is independent of the bounded input ring. Holding its
+     * mutex through validation/post also prevents a reset crossing delivery. */
+    pthread_mutex_unlock(&winios_desktop_control.lock);
+    return closed;
+}
+/* DESKTOP_CONTROL_END */
+
 #define WINIOS_RING_SIZE 256
 #define WINIOS_EV_MOUSE 0
 #define WINIOS_EV_KEY   1
@@ -720,6 +784,7 @@ void winios_post_key(int vk, int down) {
 }
 
 BOOL winios_pProcessEvents(DWORD mask) {
+    int desktop_closed = winios_control_process_events();
     /* The restored born-minimized window's own thread brings it to the front
      * (see g_restore_foreground); other threads leave the request in place. */
     uintptr_t fg = atomic_load_explicit(&g_restore_foreground, memory_order_relaxed);
@@ -748,7 +813,7 @@ BOOL winios_pProcessEvents(DWORD mask) {
             winios_dump_window_tree();
         }
     }
-    BOOL drained = FALSE;
+    BOOL drained = desktop_closed;
     for (;;) {
         winios_input_event_t e;
         pthread_mutex_lock(&g_input_q.lock);
@@ -1066,6 +1131,7 @@ void winios_note_game_metal_hwnd(void *hwnd) {
 /* Called at every Wine session start (WineProcessBridge): a game session
  * starts with no overlay windows and no known Metal windows. */
 void winios_session_reset(void) {
+    winios_control_reset();
     dispatch_async(dispatch_get_main_queue(), ^{
         [g_game_metal removeAllObjects];
         if (g_comp_game) winios_drop_compositor("new session");

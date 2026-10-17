@@ -54,8 +54,25 @@
 	<true/>
 	<key>NSBonjourServices</key>
 	<array>
+		<string>_remotepairing._tcp</string>
 		<string>_remotepairing-pairable-host._tcp</string>
 	</array>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>steampowered.com</key>
+			<dict><key>NSIncludesSubdomains</key><true/></dict>
+			<key>steamcommunity.com</key>
+			<dict><key>NSIncludesSubdomains</key><true/></dict>
+			<key>epicgames.com</key>
+			<dict><key>NSIncludesSubdomains</key><true/></dict>
+			<key>epicgames.dev</key>
+			<dict><key>NSIncludesSubdomains</key><true/></dict>
+		</dict>
+	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Madeira uses the local network to pair with this device for JIT, without a computer.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>

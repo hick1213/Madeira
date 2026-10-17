@@ -20,6 +20,7 @@
 #include <initguid.h>
 #include <windows.h>
 #include <d3d12.h>
+#include "madeira_composition.h"
 #include <dxgi1_5.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -100,6 +101,31 @@ static void d3d12_log(const char *fmt, ...) {
     fputs(buf, stderr);
     fflush(stderr);
 }
+
+/* Same opt-in as dxgi.dll; numeric IDs only and at most 64 records. */
+static BOOL mad_swap_route_enabled(void) {
+    static volatile LONG enabled = -1;
+    LONG on = InterlockedCompareExchange(&enabled, -1, -1);
+    if (on < 0) {
+        char value[2] = {0};
+        on = GetEnvironmentVariableA("MADEIRA_SWAP_ROUTE_TRACE", value, sizeof(value)) == 1 && value[0] == '1';
+        InterlockedExchange(&enabled, on);
+    }
+    return on != 0;
+
+}
+
+static void mad_swap_route_trace(const char *stage, const void *object, const void *device,
+                                 HWND hwnd, UINT width, UINT height, HRESULT hr,
+                                 const void *selected, const void *swap) {
+    static volatile LONG count;
+    LONG seq = InterlockedIncrement(&count);
+    if (seq > 64) return;
+    d3d12_log("[swap-route] mad #%ld stage=%s object=%p device=%p hwnd=%p size=%ux%u hr=%#lx selected=%p swap=%p\n",
+              (long)seq, stage, object, device, (void *)hwnd, width, height, (unsigned long)hr, selected, swap);
+}
+
+#define MAD_SWAP_ROUTE_TRACE(...) do { if (mad_swap_route_enabled()) mad_swap_route_trace(__VA_ARGS__); } while (0)
 
 void madeira_d3d12_note_unimplemented(const char *iface, const char *method) {
     /* Rate limiting is per call site rather than global: one chatty method must
@@ -1335,9 +1361,12 @@ struct mad_queue {
 
 static HRESULT mad_queue_dxgi_tearoff(struct mad_queue *q, void **out);
 static HRESULT STDMETHODCALLTYPE queue_QI(ID3D12CommandQueue *This, REFIID riid, void **out) {
+    BOOL private_dxgi = out && IsEqualGUID(riid, &IID_IMTLDXGIDevice);
+    if (private_dxgi) MAD_SWAP_ROUTE_TRACE("queue-private-qi-entry", This, ((struct mad_queue *)This)->device, NULL, 0, 0, S_OK, NULL, NULL);
     HRESULT hr = mad_qi((struct mad_obj *)This, riid, out, 1);
-    if (hr == E_NOINTERFACE && IsEqualGUID(riid, &IID_IMTLDXGIDevice))
-        return mad_queue_dxgi_tearoff((struct mad_queue *)This, out);
+    if (hr == E_NOINTERFACE && private_dxgi)
+        hr = mad_queue_dxgi_tearoff((struct mad_queue *)This, out);
+    if (private_dxgi) MAD_SWAP_ROUTE_TRACE("queue-private-qi-return", This, ((struct mad_queue *)This)->device, NULL, 0, 0, hr, out ? *out : NULL, NULL);
     return hr;
 }
 static ULONG STDMETHODCALLTYPE queue_AddRef(ID3D12CommandQueue *This) { return mad_addref((struct mad_obj *)This); }
@@ -6114,6 +6143,49 @@ static void mad_format_info(DXGI_FORMAT f, UINT *bytes, UINT *block) {
 
 static UINT64 mad_align(UINT64 v, UINT64 a) { return (v + a - 1) & ~(a - 1); }
 
+/* Reject invalid cardinalities before Metal sees a descriptor, including a
+ * texture width that would truncate when copied into WMTTextureInfo. */
+static int mad_resource_dimensions_valid(const D3D12_RESOURCE_DESC *desc) {
+    if (!desc->Width || !desc->DepthOrArraySize) return 0;
+    switch (desc->Dimension) {
+    case D3D12_RESOURCE_DIMENSION_BUFFER:
+        return desc->Height == 1 && desc->DepthOrArraySize == 1;
+    case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
+        return desc->Width <= 0xffffffffu && desc->Height == 1;
+    case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
+    case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
+        return desc->Width <= 0xffffffffu && desc->Height != 0;
+    default:
+        return 0;
+    }
+}
+
+static void mad_invalid_resource_desc_log(const char *api, const D3D12_RESOURCE_DESC *desc, D3D12_HEAP_TYPE heap_type) {
+    static LONG said;
+    if (InterlockedIncrement(&said) <= 32)
+        d3d12_log("[madeira-d3d12] %s rejected resource dimensions: dim %u width %llu height %u depth/array %u mips %u format %u samples %u/%u heap-type %u\n",
+                  api, (unsigned)desc->Dimension, (unsigned long long)desc->Width, desc->Height,
+                  desc->DepthOrArraySize, desc->MipLevels, (unsigned)desc->Format,
+                  desc->SampleDesc.Count, desc->SampleDesc.Quality, (unsigned)heap_type);
+}
+
+static int mad_resource_descs_valid(const char *api, UINT n, const D3D12_RESOURCE_DESC *descs, UINT64 *alignment) {
+    UINT i;
+    int valid = 1;
+    *alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    if (n && !descs) return 0;
+    /* Preflight the whole array before even an earlier valid entry reaches
+     * Metal. Failure alignment is MSAA alignment if any descriptor uses it. */
+    for (i = 0; i < n; i++) {
+        if (descs[i].SampleDesc.Count > 1) *alignment = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
+        if (!mad_resource_dimensions_valid(&descs[i])) {
+            mad_invalid_resource_desc_log(api, &descs[i], (D3D12_HEAP_TYPE)0);
+            valid = 0;
+        }
+    }
+    return valid;
+}
+
 /* The standard subresource layout: rows padded to 256 bytes, each subresource
  * starting on a 512-byte boundary. Both constants are the API's own. */
 static void STDMETHODCALLTYPE device_GetCopyableFootprints(ID3D12Device *This,
@@ -6162,6 +6234,11 @@ static D3D12_RESOURCE_ALLOCATION_INFO * STDMETHODCALLTYPE device_GetResourceAllo
         const D3D12_RESOURCE_DESC *descs) {
     UINT64 total = 0, align = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, i;
     (void)visible_mask;
+    if (!mad_resource_descs_valid("GetResourceAllocationInfo", n, descs, &align)) {
+        ret->SizeInBytes = ~(UINT64)0;
+        ret->Alignment = align;
+        return ret;
+    }
     for (i = 0; i < n; i++) {
         const D3D12_RESOURCE_DESC *d = &descs[i];
         UINT64 bytes = 0, a = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, msz = 0, mal = 0;
@@ -7387,6 +7464,7 @@ static void mad_placed_fallback(const struct mad_memheap *h, const D3D12_RESOURC
  * plans its heap with is the size the placement really takes. */
 static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTTextureInfo *ti, enum WMTPixelFormat *pf, int *is_depth) {
     UINT layers = desc->DepthOrArraySize ? desc->DepthOrArraySize : 1;
+    if (!mad_resource_dimensions_valid(desc)) return 0;
     if (!mad_map_texture_format(desc->Format, desc->Flags, pf, is_depth)) return 0;
     memset(ti, 0, sizeof *ti);
     ti->pixel_format = *pf;
@@ -7439,7 +7517,11 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                                       struct mad_memheap *ph, UINT64 poff) {
     struct mad_resource *r;
     HRESULT hr;
-    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) { mad_refuse_log(desc, heap_type, "dimension UNKNOWN"); return E_INVALIDARG; }
+    if (out) *out = NULL;
+    if (!mad_resource_dimensions_valid(desc)) {
+        mad_invalid_resource_desc_log(ph ? "CreatePlacedResource" : "CreateCommittedResource", desc, heap_type);
+        return E_INVALIDARG;
+    }
 
     r = calloc(1, sizeof *r);
     if (!r) return E_OUTOFMEMORY;
@@ -7589,6 +7671,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource(ID3D12Device *Th
     (void)heap_flags; (void)state; (void)clear;
     HRESULT hr;
     static unsigned said;
+    if (out) *out = NULL;
     if (!heap || !desc || !out) { if (said++ < 8) d3d12_log("[madeira-d3d12] CreateCommittedResource: null props/desc/out\n"); return E_INVALIDARG; }
     hr = mad_create_resource((struct mad_device *)This, heap->Type, desc, riid, out);
     if (desc->Width >= (32u << 20) && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && said++ < 64)
@@ -7695,6 +7778,7 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource(ID3D12Device *This,
     HRESULT hr;
     static unsigned said;
     (void)state; (void)clear;
+    if (out) *out = NULL;
     if (!h || !desc || !out) { if (said++ < 8) d3d12_log("[madeira-d3d12] CreatePlacedResource: null heap/desc/out\n"); return E_INVALIDARG; }
     hr = mad_create_resource_at((struct mad_device *)This, h->desc.Properties.Type, desc, riid, out, h, offset);   /* ml1145 */
     /* ml895: every placement inside a TRANSIENT heap (4 MB aligned, NOT_ZEROED)
@@ -11488,7 +11572,12 @@ static D3D12_RESOURCE_ALLOCATION_INFO * STDMETHODCALLTYPE device_GetResourceAllo
      * sequentially with each resource at its own alignment. */
     UINT64 off = 0, align = 0; UINT i;
     memset(ret, 0, sizeof *ret);
-    if (!descs || !n) return ret;
+    if (!n) return ret;
+    if (!mad_resource_descs_valid("GetResourceAllocationInfo1", n, descs, &align)) {
+        ret->SizeInBytes = ~(UINT64)0;
+        ret->Alignment = align;
+        return ret;
+    }
     for (i = 0; i < n; i++) {
         D3D12_RESOURCE_ALLOCATION_INFO one;
         device_GetResourceAllocationInfo((ID3D12Device *)This, &one, visible, 1, &descs[i]);
@@ -11505,7 +11594,8 @@ static D3D12_RESOURCE_ALLOCATION_INFO * STDMETHODCALLTYPE device_GetResourceAllo
         D3D12_RESOURCE_ALLOCATION_INFO1 *info1) {
     D3D12_RESOURCE_DESC stackd[8], *d = stackd; UINT i;
     memset(ret, 0, sizeof *ret);
-    if (!descs1 || !n) return ret;
+    if (!n) return ret;
+    if (!descs1) return device_GetResourceAllocationInfo1(This, ret, visible, n, NULL, info1);
     if (n > 8) { d = calloc(n, sizeof *d); if (!d) return ret; }
     for (i = 0; i < n; i++) mad_desc1_to_desc(&descs1[i], &d[i]);
     device_GetResourceAllocationInfo1(This, ret, visible, n, d, info1);
@@ -12157,8 +12247,14 @@ struct mad_swapchain {
     /* MetalFX spatial upscaling of the presented image (madeira.cfg metalfx-upscale) */
     obj_handle_t fx_scaler, fx_out, fx_view[MAD_SWAP_MAX_BUFFERS];
     UINT fx_w, fx_h;
+    BOOL composition;
+    IMadeiraCompositionSurface composition_surface;
+    CRITICAL_SECTION composition_lock; /* caller Present/Bind/Resize; worker never takes it */
+    struct mad_swapchain *composition_next;
 };
 static IDXGISwapChain4Vtbl g_swap_vtbl;
+static SRWLOCK g_composition_bind_lock = SRWLOCK_INIT;
+static struct mad_swapchain *g_composition_bound;
 
 static void mad_swap_release_fx(struct mad_swapchain *s) {
     UINT i;
@@ -12243,6 +12339,7 @@ static const void *g_layer_cfg_owner;
 static void mad_swap_apply_layer(struct mad_swapchain *s) {
     struct WMTLayerProps props;
     memset(&props, 0, sizeof props);
+    if (!s->layer) return; /* Composition buffers exist before visual-tree binding. */
     MetalLayer_getProps(s->layer, &props);
     props.device = s->dev->mtl_device;
     /* MetalFX upscaling: the drawable is the scaled size (fx_w x fx_h). */
@@ -12251,9 +12348,78 @@ static void mad_swap_apply_layer(struct mad_swapchain *s) {
     props.pixel_format = s->pf;
     props.framebuffer_only = false;
     props.display_sync_enabled = true;
+    if (s->composition) props.opaque = s->desc.AlphaMode == DXGI_ALPHA_MODE_IGNORE;
     MetalLayer_setProps(s->layer, &props);
     g_layer_cfg_layer = s->layer;
     g_layer_cfg_owner = s;
+}
+
+static HRESULT mad_composition_validate_desc(const DXGI_SWAP_CHAIN_DESC1 *desc) {
+    if (!desc || !desc->Width || !desc->Height || desc->Stereo ||
+        desc->SampleDesc.Count != 1 || desc->SampleDesc.Quality ||
+        desc->BufferCount < 2 || desc->BufferCount > MAD_SWAP_MAX_BUFFERS ||
+        desc->Scaling != DXGI_SCALING_STRETCH ||
+        (desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL &&
+         desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD)) return DXGI_ERROR_INVALID_CALL;
+    if (desc->AlphaMode != DXGI_ALPHA_MODE_IGNORE && desc->AlphaMode != DXGI_ALPHA_MODE_PREMULTIPLIED)
+        return DXGI_ERROR_UNSUPPORTED;
+    return S_OK;
+}
+
+/* A game-mode frontend may supply one layer for multiple HWNDs. Composition
+ * never steals such a layer from another composition target. */
+static BOOL mad_composition_claim_layer(struct mad_swapchain *s) {
+    struct mad_swapchain *other;
+    BOOL available = TRUE;
+    AcquireSRWLockExclusive(&g_composition_bind_lock);
+    for (other = g_composition_bound; other; other = other->composition_next)
+        if (other != s && (other->layer == s->layer || other->hwnd == s->hwnd)) { available = FALSE; break; }
+    if (available) { s->composition_next = g_composition_bound; g_composition_bound = s; }
+    ReleaseSRWLockExclusive(&g_composition_bind_lock);
+    return available;
+}
+static void mad_composition_unclaim_layer(struct mad_swapchain *s) {
+    struct mad_swapchain **link;
+    AcquireSRWLockExclusive(&g_composition_bind_lock);
+    for (link = &g_composition_bound; *link; link = &(*link)->composition_next)
+        if (*link == s) { *link = s->composition_next; break; }
+    s->composition_next = NULL;
+    ReleaseSRWLockExclusive(&g_composition_bind_lock);
+}
+
+static HRESULT mad_composition_bind_swapchain(struct mad_swapchain *s, HWND hwnd) {
+    HRESULT hr = S_OK;
+    DWORD pid = 0;
+    obj_handle_t view, layer = 0;
+    if (!s->composition) return E_INVALIDARG;
+    EnterCriticalSection(&s->composition_lock);
+    if (hwnd && (!IsWindow(hwnd) || !GetWindowThreadProcessId(hwnd, &pid))) { hr = E_INVALIDARG; goto done; }
+    if (hwnd && pid != GetCurrentProcessId()) { hr = E_ACCESSDENIED; goto done; }
+    if (s->hwnd == hwnd) goto done;
+    if (hwnd && s->hwnd) { hr = E_INVALIDARG; goto done; }
+    /* Caller Present holds this same lock through enqueue, so drain cannot
+     * be followed by a new job using the state being detached. */
+    if (s->queue && s->queue->sub_thread) mad_queue_drain(s->queue);
+    if (!hwnd) {
+        mad_composition_unclaim_layer(s);
+        view = s->view;
+        s->hwnd = NULL; s->view = s->layer = 0;
+        if (g_layer_cfg_owner == s) g_layer_cfg_owner = NULL;
+        if (view) ReleaseMetalView(view);
+        goto done; /* NULL detach is infallible and idempotent for this interface. */
+    }
+    view = CreateMetalViewFromHWND((intptr_t)hwnd, s->dev->mtl_device, &layer);
+    if (!view || !layer) { if (view) ReleaseMetalView(view); hr = DXGI_ERROR_UNSUPPORTED; goto done; }
+    s->hwnd = hwnd; s->view = view; s->layer = layer;
+    if (!mad_composition_claim_layer(s)) {
+        s->hwnd = NULL; s->view = s->layer = 0;
+        ReleaseMetalView(view); hr = DXGI_ERROR_UNSUPPORTED; goto done;
+    }
+    mad_swap_apply_layer(s);
+    MAD_SWAP_ROUTE_TRACE("composition-bind", s, s->dev, hwnd, s->desc.Width, s->desc.Height, S_OK, NULL, s);
+done:
+    LeaveCriticalSection(&s->composition_lock);
+    return hr;
 }
 
 static HRESULT mad_swap_make_buffers(struct mad_swapchain *s) {
@@ -12293,9 +12459,36 @@ static HRESULT mad_swap_make_buffers(struct mad_swapchain *s) {
     return S_OK;
 }
 
+static HRESULT STDMETHODCALLTYPE swap_QI(IDXGISwapChain4 *, REFIID, void **);
+static ULONG STDMETHODCALLTYPE swap_AddRef(IDXGISwapChain4 *);
+static ULONG STDMETHODCALLTYPE swap_Release(IDXGISwapChain4 *);
+static struct mad_swapchain *mad_composition_owner(IMadeiraCompositionSurface *surface) {
+    return CONTAINING_RECORD(surface, struct mad_swapchain, composition_surface);
+}
+static HRESULT STDMETHODCALLTYPE composition_surface_QI(IMadeiraCompositionSurface *surface, REFIID riid, void **out) {
+    return swap_QI((IDXGISwapChain4 *)mad_composition_owner(surface), riid, out);
+}
+static ULONG STDMETHODCALLTYPE composition_surface_AddRef(IMadeiraCompositionSurface *surface) {
+    return swap_AddRef((IDXGISwapChain4 *)mad_composition_owner(surface));
+}
+static ULONG STDMETHODCALLTYPE composition_surface_Release(IMadeiraCompositionSurface *surface) {
+    return swap_Release((IDXGISwapChain4 *)mad_composition_owner(surface));
+}
+static HRESULT STDMETHODCALLTYPE composition_surface_Bind(IMadeiraCompositionSurface *surface, HWND hwnd) {
+    return mad_composition_bind_swapchain(mad_composition_owner(surface), hwnd);
+}
+static const IMadeiraCompositionSurfaceVtbl g_composition_surface_vtbl = {
+    composition_surface_QI, composition_surface_AddRef, composition_surface_Release, composition_surface_Bind
+};
+
 static HRESULT STDMETHODCALLTYPE swap_QI(IDXGISwapChain4 *T, REFIID riid, void **out) {
     struct mad_obj *o = (struct mad_obj *)T;
     if (!out) return E_POINTER;
+    if (((struct mad_swapchain *)T)->composition && IsEqualGUID(riid, &IID_IMadeiraCompositionSurface)) {
+        InterlockedIncrement(&o->refs);
+        *out = &((struct mad_swapchain *)T)->composition_surface;
+        return S_OK;
+    }
     if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IDXGIObject) ||
         IsEqualGUID(riid, &IID_IDXGIDeviceSubObject) || IsEqualGUID(riid, &IID_IDXGISwapChain) ||
         IsEqualGUID(riid, &IID_IDXGISwapChain1) || IsEqualGUID(riid, &IID_IDXGISwapChain2) ||
@@ -12313,6 +12506,7 @@ static ULONG STDMETHODCALLTYPE swap_Release(IDXGISwapChain4 *T) {
     LONG n = InterlockedDecrement(&s->refs);
     if (n == 0) { mad_pd_purge(T);   /* ml1143 */
         if (s->queue && s->queue->sub_thread) mad_queue_drain(s->queue);   /* ml1121: queued presents name this swapchain */
+        if (s->composition) mad_composition_bind_swapchain(s, NULL);
         mad_swap_release_buffers(s);
         if (g_layer_cfg_owner == s) g_layer_cfg_owner = NULL;   /* the next Present re-applies its own layer settings */
         if (s->view) ReleaseMetalView(s->view);
@@ -12320,6 +12514,7 @@ static ULONG STDMETHODCALLTYPE swap_Release(IDXGISwapChain4 *T) {
         if (s->factory) IDXGIFactory1_Release(s->factory);
         ID3D12CommandQueue_Release((ID3D12CommandQueue *)s->queue);
         d3d12_log("[madeira-d3d12] swapchain destroyed after %llu presents\n", (unsigned long long)s->presents);
+        if (s->composition) DeleteCriticalSection(&s->composition_lock);
         free(s);
     }
     return (ULONG)n;
@@ -12354,11 +12549,29 @@ static HRESULT STDMETHODCALLTYPE swap_GetDevice(IDXGISwapChain4 *T, REFIID riid,
  * It also stops leaking one command buffer per frame. */
 static HRESULT swap_Present_inner(IDXGISwapChain4 *T, UINT sync, UINT flags);
 static HRESULT swap_Present_pool(IDXGISwapChain4 *T, UINT sync, UINT flags);
-static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UINT flags) {   /* ml1119: timed wrapper */
+static HRESULT mad_composition_present_unbound(struct mad_swapchain *s) {
+    if (s->queue && s->queue->sub_thread) mad_queue_drain(s->queue);
+    mad_device_flush_all(s->queue->device);
+    s->index = (s->index + 1) % s->nbuf;
+    s->presents++;
+    MAD_SWAP_ROUTE_TRACE("present-unbound", s, s->dev, NULL, s->desc.Width, s->desc.Height, S_OK, s->queue, s);
+    return S_OK; /* Accepted offscreen frame; no drawable or visible present. */
+}
+
+static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UINT flags) {
+    static volatile LONG traced_presents;
+    if (mad_swap_route_enabled() && InterlockedIncrement(&traced_presents) <= 3) {
+        struct mad_swapchain *route = (struct mad_swapchain *)T;
+        MAD_SWAP_ROUTE_TRACE("present-entry", route, route->dev, route->hwnd,
+                             route->desc.Width, route->desc.Height, S_OK, route->queue, route);
+    }
+   /* ml1119: timed wrapper */
     LARGE_INTEGER t0, t1; HRESULT hr;
     mad_xp_role('P'); InterlockedIncrement64(&g_xp.pres_enq);   /* ml1128 */
     QueryPerformanceCounter(&t0);
+    if (((struct mad_swapchain *)T)->composition) EnterCriticalSection(&((struct mad_swapchain *)T)->composition_lock);
     hr = swap_Present_pool(T, sync, flags);
+    if (((struct mad_swapchain *)T)->composition) LeaveCriticalSection(&((struct mad_swapchain *)T)->composition_lock);
     QueryPerformanceCounter(&t1);
     InterlockedExchangeAdd64(&g_perf_present_ticks, t1.QuadPart - t0.QuadPart);
     return hr;
@@ -12375,6 +12588,7 @@ static HRESULT swap_Present_inner(IDXGISwapChain4 *T, UINT sync, UINT flags) {
     (void)sync;
     if (flags & DXGI_PRESENT_TEST) return S_OK;
     if (!s->nbuf) return DXGI_ERROR_INVALID_CALL;
+    if (s->composition && !s->layer) return mad_composition_present_unbound(s);
     if (q && q->sub_thread) {   /* ml1121: queue the present behind this frame's lists and return */
         struct mad_subjob *j = calloc(1, sizeof *j);
         if (j) {
@@ -12397,7 +12611,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     struct mad_resource *src;
     obj_handle_t drawable, tex, cb, enc;
     struct wmtcmd_blit_copy_from_texture_to_texture t2t;
-    if (idx >= s->nbuf) return;
+    if (idx >= s->nbuf || (s->composition && !s->layer)) return;
     src = s->buffers[idx];
     mad_mheap_reclaim(s->dev, 0);   /* ml1148: once a frame, heaps whose GPU work is long done */
     { LONG64 tf = mad_qpc();   /* ml1128 */
@@ -12540,6 +12754,7 @@ static HRESULT STDMETHODCALLTYPE swap_SetFullscreenState(IDXGISwapChain4 *T, BOO
     (void)target;
     /* The window is what the desktop says it is; fullscreen is recorded so the
      * application reads back what it set, and changes nothing else. */
+    if (s->composition) return DXGI_ERROR_INVALID_CALL;
     s->fs.Windowed = !fs;
     return S_OK;
 }
@@ -12561,13 +12776,13 @@ static HRESULT STDMETHODCALLTYPE swap_GetDesc(IDXGISwapChain4 *T, DXGI_SWAP_CHAI
     d->SampleDesc = s->desc.SampleDesc;
     d->BufferUsage = s->desc.BufferUsage;
     d->BufferCount = s->nbuf;
-    d->OutputWindow = s->hwnd;
+    d->OutputWindow = s->composition ? NULL : s->hwnd;
     d->Windowed = s->fs.Windowed;
     d->SwapEffect = s->desc.SwapEffect;
     d->Flags = s->desc.Flags;
     return S_OK;
 }
-static HRESULT STDMETHODCALLTYPE swap_ResizeBuffers(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
+static HRESULT swap_ResizeBuffers_inner(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     UINT i;
     if (s->queue && s->queue->sub_thread) mad_queue_drain(s->queue);   /* ml1120: no list may still reference the old buffers */
@@ -12582,13 +12797,31 @@ static HRESULT STDMETHODCALLTYPE swap_ResizeBuffers(IDXGISwapChain4 *T, UINT cou
     s->desc.Flags = flags;
     return mad_swap_make_buffers(s);
 }
-static HRESULT STDMETHODCALLTYPE swap_ResizeTarget(IDXGISwapChain4 *T, const DXGI_MODE_DESC *m) { (void)T; (void)m; return S_OK; }
+static HRESULT STDMETHODCALLTYPE swap_ResizeBuffers(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
+    struct mad_swapchain *s = (struct mad_swapchain *)T;
+    HRESULT hr;
+    if (s->composition) {
+        if ((count && (count < 2 || count > MAD_SWAP_MAX_BUFFERS)) || !w || !h) return DXGI_ERROR_INVALID_CALL;
+        EnterCriticalSection(&s->composition_lock);
+        if (s->queue && s->queue->sub_thread) mad_queue_drain(s->queue);
+        for (UINT i = 0; i < s->nbuf; ++i)
+            if (s->buffers[i] && s->buffers[i]->refs > 1) {
+                LeaveCriticalSection(&s->composition_lock);
+                return DXGI_ERROR_INVALID_CALL;
+            }
+    }
+    hr = swap_ResizeBuffers_inner(T, count, w, h, fmt, flags);
+    if (s->composition) LeaveCriticalSection(&s->composition_lock);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE swap_ResizeTarget(IDXGISwapChain4 *T, const DXGI_MODE_DESC *m) { (void)m; if (((struct mad_swapchain *)T)->composition) return DXGI_ERROR_INVALID_CALL; return S_OK; }
 static HRESULT STDMETHODCALLTYPE swap_GetContainingOutput(IDXGISwapChain4 *T, IDXGIOutput **out) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     IDXGIAdapter1 *adapter = NULL;
     HRESULT hr;
     if (!out) return E_POINTER;
     *out = NULL;
+    if (s->composition) return DXGI_ERROR_INVALID_CALL;
     if (!s->factory) return DXGI_ERROR_UNSUPPORTED;
     hr = IDXGIFactory1_EnumAdapters1(s->factory, 0, &adapter);
     if (FAILED(hr)) return hr;
@@ -12622,6 +12855,8 @@ static HRESULT STDMETHODCALLTYPE swap_GetFullscreenDesc(IDXGISwapChain4 *T, DXGI
 }
 static HRESULT STDMETHODCALLTYPE swap_GetHwnd(IDXGISwapChain4 *T, HWND *h) {
     if (!h) return E_INVALIDARG;
+    *h = NULL;
+    if (((struct mad_swapchain *)T)->composition) return DXGI_ERROR_INVALID_CALL;
     *h = ((struct mad_swapchain *)T)->hwnd;
     return S_OK;
 }
@@ -12669,18 +12904,24 @@ static HRESULT STDMETHODCALLTYPE swap_ResizeBuffers1(IDXGISwapChain4 *T, UINT co
 }
 static HRESULT STDMETHODCALLTYPE swap_SetHDRMetaData(IDXGISwapChain4 *T, DXGI_HDR_METADATA_TYPE type, UINT n, void *d) { (void)T; (void)type; (void)n; (void)d; return S_OK; }
 
-static HRESULT mad_swapchain_create(struct mad_queue *q, IDXGIFactory1 *factory, HWND hwnd,
+static HRESULT mad_swapchain_create_impl(struct mad_queue *q, IDXGIFactory1 *factory, HWND hwnd,
                                     const DXGI_SWAP_CHAIN_DESC1 *desc,
                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs, IDXGISwapChain1 **out) {
     struct mad_swapchain *s;
     HRESULT hr;
     if (!out) return E_POINTER;
     *out = NULL;
-    if (!q || !desc || !hwnd) return DXGI_ERROR_INVALID_CALL;
+    if (!q || !desc) return DXGI_ERROR_INVALID_CALL;
+    if (!hwnd && FAILED(hr = mad_composition_validate_desc(desc))) return hr;
     s = calloc(1, sizeof *s);
     if (!s) return E_OUTOFMEMORY;
     s->vtbl = &g_swap_vtbl; s->refs = 1; s->iid = &IID_IDXGISwapChain4; s->name = "SwapChain";
     s->dev = q->device; s->queue = q;
+    s->composition = !hwnd;
+    if (s->composition) {
+        s->composition_surface.lpVtbl = &g_composition_surface_vtbl;
+        InitializeCriticalSection(&s->composition_lock);
+    }
     ID3D12CommandQueue_AddRef((ID3D12CommandQueue *)q);
     s->factory = factory;
     if (factory) IDXGIFactory1_AddRef(factory);
@@ -12688,8 +12929,8 @@ static HRESULT mad_swapchain_create(struct mad_queue *q, IDXGIFactory1 *factory,
     s->desc = *desc;
     if (fs) s->fs = *fs; else s->fs.Windowed = TRUE;
     s->max_latency = 1;
-    s->view = CreateMetalViewFromHWND((intptr_t)hwnd, s->dev->mtl_device, &s->layer);
-    if (!s->view || !s->layer) {
+    if (hwnd) s->view = CreateMetalViewFromHWND((intptr_t)hwnd, s->dev->mtl_device, &s->layer);
+    if (hwnd && (!s->view || !s->layer)) {
         d3d12_log("[madeira-d3d12] swapchain: no Metal view for hwnd %p\n", (void *)hwnd);
         swap_Release((IDXGISwapChain4 *)s);
         return DXGI_ERROR_UNSUPPORTED;
@@ -12698,6 +12939,17 @@ static HRESULT mad_swapchain_create(struct mad_queue *q, IDXGIFactory1 *factory,
     if (FAILED(hr)) { swap_Release((IDXGISwapChain4 *)s); return hr; }
     *out = (IDXGISwapChain1 *)s;
     return S_OK;
+}
+
+static HRESULT mad_swapchain_create(struct mad_queue *q, IDXGIFactory1 *factory, HWND hwnd,
+                                    const DXGI_SWAP_CHAIN_DESC1 *desc,
+                                    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs, IDXGISwapChain1 **out) {
+    MAD_SWAP_ROUTE_TRACE("swap-create-entry", q, q ? q->device : NULL, hwnd,
+                         desc ? desc->Width : 0, desc ? desc->Height : 0, S_OK, factory, NULL);
+    HRESULT hr = mad_swapchain_create_impl(q, factory, hwnd, desc, fs, out);
+    MAD_SWAP_ROUTE_TRACE("swap-create-return", q, q ? q->device : NULL, hwnd,
+                         desc ? desc->Width : 0, desc ? desc->Height : 0, hr, factory, out ? *out : NULL);
+    return hr;
 }
 
 /* ---- the tear-off dxgi.dll asks the queue for ---------------------------

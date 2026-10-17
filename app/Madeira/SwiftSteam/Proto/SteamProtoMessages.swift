@@ -226,6 +226,154 @@ struct ProtobufDecoder {
     }
 }
 
+// MARK: - Content Server Directory
+
+enum SteamContentDirectoryMessage {
+    private static let maximumSize = 2 * 1024 * 1024
+    private static let stringFields: [UInt32: String] = [
+        1: "type", 8: "host", 9: "vhost", 11: "proxy_request_path_template",
+        12: "https_support", 17: "group"
+    ]
+    private static let integerFields: [UInt32: String] = [
+        2: "source_id", 3: "cell_id", 4: "load", 6: "num_entries"
+    ]
+
+    static func request(cellID: UInt32, ipOverride: String? = nil) -> Data {
+        var encoder = ProtobufEncoder()
+        encoder.writeTag(fieldNumber: 1, wireType: .varint)
+        encoder.writeVarint(UInt64(cellID))
+        encoder.writeUInt32(fieldNumber: 2, value: 100)
+        if let ipOverride { encoder.writeString(fieldNumber: 3, value: ipOverride) }
+        return encoder.data
+    }
+
+    static func response(_ data: Data) throws -> Data {
+        guard data.count <= maximumSize else { throw SteamError.protobufError("Directory response too large") }
+        var decoder = ProtobufDecoder(data)
+        var servers: [[String: Any]] = []
+        var noChange = false
+        var jsonSize = 32
+        while let tag = try nextTag(&decoder) {
+            switch tag.fieldNumber {
+            case 1:
+                try requireWire(tag.wireType, .lengthDelimited)
+                let server = try serverInfo(readBytes(&decoder))
+                jsonSize += try JSONSerialization.data(withJSONObject: server).count + 1
+                guard jsonSize <= maximumSize else { throw SteamError.protobufError("Directory JSON too large") }
+                servers.append(server)
+            case 2:
+                try requireWire(tag.wireType, .varint)
+                noChange = try readVarint(&decoder) != 0
+            default: try skip(&decoder, wireType: tag.wireType)
+            }
+        }
+        guard !noChange || !servers.isEmpty else {
+            throw SteamError.protobufError("Directory no_change has no base response")
+        }
+        let json = try JSONSerialization.data(withJSONObject: ["response": ["servers": servers]])
+        guard json.count <= maximumSize else { throw SteamError.protobufError("Directory JSON too large") }
+        return json
+    }
+
+    private static func serverInfo(_ data: Data) throws -> [String: Any] {
+        var decoder = ProtobufDecoder(data)
+        var result: [String: Any] = [:]
+        var appIDs: [UInt32] = []
+        var hasAppIDs = false
+        var bypassTypes: [String] = []
+        while let tag = try nextTag(&decoder) {
+            if let key = stringFields[tag.fieldNumber] {
+                try requireWire(tag.wireType, .lengthDelimited)
+                guard let value = String(data: try readBytes(&decoder), encoding: .utf8) else {
+                    throw SteamError.protobufError("Invalid directory UTF-8")
+                }
+                result[key] = value
+            } else if let key = integerFields[tag.fieldNumber] {
+                try requireWire(tag.wireType, .varint)
+                result[key] = Int32(truncatingIfNeeded: try readVarint(&decoder))
+            } else {
+                switch tag.fieldNumber {
+                case 5:
+                    try requireWire(tag.wireType, .fixed32)
+                    let value = Float(bitPattern: try decoder.readFixed32())
+                    guard value.isFinite else { throw SteamError.protobufError("Invalid directory load") }
+                    result["weighted_load"] = value
+                case 7, 10:
+                    try requireWire(tag.wireType, .varint)
+                    result[tag.fieldNumber == 7 ? "steam_china_only" : "use_as_proxy"] = try readVarint(&decoder) != 0
+                case 13:
+                    hasAppIDs = true
+                    if tag.wireType == .lengthDelimited {
+                        var packed = ProtobufDecoder(try readBytes(&decoder))
+                        while !packed.isAtEnd { appIDs.append(try readUInt32(&packed)) }
+                    } else {
+                        try requireWire(tag.wireType, .varint)
+                        appIDs.append(try readUInt32(&decoder))
+                    }
+                case 15:
+                    try requireWire(tag.wireType, .varint)
+                    result["priority_class"] = try readUInt32(&decoder)
+                case 16:
+                    try requireWire(tag.wireType, .lengthDelimited)
+                    guard let value = String(data: try readBytes(&decoder), encoding: .utf8) else {
+                        throw SteamError.protobufError("Invalid directory UTF-8")
+                    }
+                    bypassTypes.append(value)
+                default: try skip(&decoder, wireType: tag.wireType)
+                }
+            }
+        }
+        if hasAppIDs { result["allowed_app_ids"] = appIDs }
+        if !bypassTypes.isEmpty { result["bypass_proxies_of_type"] = bypassTypes }
+        return result
+    }
+
+    // Scope stricter network validation to this adapter; leave other messages unchanged.
+    private static func readVarint(_ decoder: inout ProtobufDecoder) throws -> UInt64 {
+        let start = decoder.offset
+        let value = try decoder.readVarint()
+        guard decoder.offset - start < 10 || decoder.data[start + 9] <= 1 else {
+            throw SteamError.protobufError("Directory varint overflow")
+        }
+        return value
+    }
+
+    private static func readUInt32(_ decoder: inout ProtobufDecoder) throws -> UInt32 {
+        guard let value = UInt32(exactly: try readVarint(&decoder)) else {
+            throw SteamError.protobufError("Directory uint32 overflow")
+        }
+        return value
+    }
+
+    private static func nextTag(_ decoder: inout ProtobufDecoder) throws -> (fieldNumber: UInt32, wireType: ProtoWireType)? {
+        guard !decoder.isAtEnd else { return nil }
+        let value = try readVarint(&decoder)
+        guard (1...0x1fff_ffff).contains(value >> 3),
+              let wire = ProtoWireType(rawValue: UInt8(value & 7)) else {
+            throw SteamError.protobufError("Invalid directory tag")
+        }
+        return (UInt32(value >> 3), wire)
+    }
+
+    private static func readBytes(_ decoder: inout ProtobufDecoder) throws -> Data {
+        var lengthCheck = decoder
+        _ = try readVarint(&lengthCheck)
+        return try decoder.readBytes()
+    }
+
+    private static func requireWire(_ actual: ProtoWireType, _ expected: ProtoWireType) throws {
+        guard actual == expected else { throw SteamError.protobufError("Invalid directory wire type") }
+    }
+
+    private static func skip(_ decoder: inout ProtobufDecoder, wireType: ProtoWireType) throws {
+        switch wireType {
+        case .varint: _ = try readVarint(&decoder)
+        case .lengthDelimited: _ = try readBytes(&decoder)
+        default: try decoder.skip(wireType: wireType)
+        }
+    }
+}
+
 // MARK: - CMsgProtoBufHeader
 
 /// Header included with every protobuf-encoded Steam message

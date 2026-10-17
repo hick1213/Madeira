@@ -73,6 +73,7 @@
 #include "ddk/ntddk.h"
 #include "unix_private.h"
 #include "ios_wow.h"
+#include "ios_native_lifetime.h"
 #include "wine/condrv.h"
 #include "wine/server.h"
 #include "wine/debug.h"
@@ -418,6 +419,7 @@ extern _Thread_local pthread_t wine_ios_main_thread;
 extern _Thread_local int wine_ios_exit_initialized;
 
 struct ios_child_args {
+    struct ios_native_reservation *native_reservation;
     int socketfd;
     int unixdir;
     char **argv;
@@ -528,7 +530,37 @@ _Thread_local WORD ios_child_main_machine;
  * nothing happening; the thread entry below names the stage in one ERR. */
 _Thread_local const char *ios_child_boot_stage = "not started";
 
-static void *ios_child_thread_entry( void *arg )
+static void ios_child_native_cleanup( void *arg )
+{
+    struct ios_child_args *args = arg;
+    sigset_t previous;
+    pthread_sigmask( SIG_BLOCK, &server_block_set, &previous );
+    {   /* ml1213: never leave the child-boot lock held by a dead boot */
+        extern void ios_child_boot_unlock( void );
+        ios_child_boot_unlock();
+    }
+
+    dprintf(STDERR_FILENO, "[Wine child thread] thread exiting cleanly\n");
+    /* The native endpoint and all its TLS destructors must die before its
+     * guest window can be released, including a failure before PEB binding. */
+    ios_native_retire_current();
+    ios_child_slot_release( args->slot );
+    free( args->argv );
+    free( args );
+
+    /* Drop our TEB reference before the implicit pthread_exit. This used to
+     * zero raw slot 275, which we squatted without owning: its real owner is
+     * a foreign Apple key whose ObjC destructor would have run on our TEB and
+     * crashed in objc_release (S0 bugs 3+7). We now only publish through our
+     * own key, whose destructor is NULL, so clearing it is all that is left. */
+    {
+        extern pthread_key_t ios_teb_tls_key;
+        pthread_setspecific( ios_teb_tls_key, NULL );
+    }
+    pthread_sigmask( SIG_SETMASK, &previous, NULL );
+}
+
+static void *ios_child_thread_body( void *arg )
 {
     struct ios_child_args *args = arg;
 
@@ -552,6 +584,7 @@ static void *ios_child_thread_entry( void *arg )
         if (args->unixdir != -1) {
             fchdir( args->unixdir );
             close( args->unixdir );
+            args->unixdir = -1;
         }
 
         dprintf(STDERR_FILENO, "[Wine child thread] calling wine_ios_child_main...\n");
@@ -561,37 +594,26 @@ static void *ios_child_thread_entry( void *arg )
     } else {
         dprintf(STDERR_FILENO, "[Wine child thread] child exited with code %d\n", wine_ios_exit_code);
     }
-    {   /* ml1213: never leave the child-boot lock held by a dead boot */
-        extern void ios_child_boot_unlock( void );
-        ios_child_boot_unlock();
-    }
+    return NULL;
+}
 
-    dprintf(STDERR_FILENO, "[Wine child thread] thread exiting cleanly\n");
-    /* the pseudo-process is over — give its guest window
-     * back so the next 32-bit pseudo-process can adopt the slot (a launcher
-     * starting the real program is the normal shape of a 32-bit title).  Must
-     * run while this thread still resolves to that process (before the TEB TLS
-     * slot is cleared below).
-     *
-     * The ORDINARY exit already did this from process_exit_wrapper, keyed by
-     * the dying PEB; this call is the FALLBACK for a child that never got far
-     * enough to bind its window to a PEB — a boot failure, where the only way
-     * back to the slot is the owner-thread match in ios_wow_slot_current().
-     * It is a no-op once the window has been released. */
-    ios_wow_window_release_current();
-    ios_child_slot_release( args->slot );
-    free( args->argv );
-    free( args );
-
-    /* Drop our TEB reference before the implicit pthread_exit. This used to
-     * zero raw slot 275, which we squatted without owning: its real owner is
-     * a foreign Apple key whose ObjC destructor would have run on our TEB and
-     * crashed in objc_release (S0 bugs 3+7). We now only publish through our
-     * own key, whose destructor is NULL, so clearing it is all that is left. */
+static void *ios_child_thread_entry( void *arg )
+{
+    struct ios_child_args *args = arg;
+    if (!ios_native_publish( args->native_reservation, NULL ))
     {
-        extern pthread_key_t ios_teb_tls_key;
-        pthread_setspecific( ios_teb_tls_key, NULL );
+        close( args->socketfd );
+        if (args->unixdir != -1) close( args->unixdir );
+        ios_child_slot_release( args->slot );
+        free( args->argv );
+        free( args );
+        return NULL;
     }
+    /* SIGQUIT can exit directly through pthread_exit, bypassing setjmp and
+     * the child body's ordinary return. Native cleanup must run either way. */
+    pthread_cleanup_push( ios_child_native_cleanup, args );
+    ios_child_thread_body( args );
+    pthread_cleanup_pop( 1 );
     return NULL;
 }
 #endif
@@ -604,6 +626,7 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     char **argv;
     struct ios_child_args *args;
     pthread_t child_thread;
+    sigset_t native_mask;
     int ret, argc;
 
     argv = build_argv( &params->CommandLine, 2 );
@@ -618,6 +641,20 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
 
     args = calloc( 1, sizeof(*args) );
     if (!args) { free( argv ); return STATUS_NO_MEMORY; }
+    /* A creator killed between reservation and pthread_create must not lose
+     * the unpublished child's token. Restore only after ownership transfers
+     * to the native child or cancellation resolves the reservation. */
+    pthread_sigmask( SIG_BLOCK, &server_block_set, &native_mask );
+    {
+        extern void ios_jit_finish_process( void *, uint64_t );
+        args->native_reservation = ios_native_process_reserve( ios_jit_finish_process );
+        if (!args->native_reservation)
+        {
+            free( args ); free( argv );
+            pthread_sigmask( SIG_SETMASK, &native_mask, NULL );
+            return STATUS_NO_MEMORY;
+        }
+    }
 
     /* dup the socketfd — parent will close the original after we return */
     args->socketfd = dup( socketfd );
@@ -636,12 +673,17 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     ret = pthread_create( &child_thread, NULL, ios_child_thread_entry, args );
     if (ret) {
         ERR("spawn_process: pthread_create failed: %d\n", ret);
+        ios_native_creation_failed( args->native_reservation );
+        close( args->socketfd );
+        if (args->unixdir != -1) close( args->unixdir );
         ios_child_slot_release( args->slot );
         free( argv );
         free( args );
+        pthread_sigmask( SIG_SETMASK, &native_mask, NULL );
         return STATUS_NO_MEMORY;
     }
     pthread_detach( child_thread );
+    pthread_sigmask( SIG_SETMASK, &native_mask, NULL );
 
     return STATUS_SUCCESS;
 #else

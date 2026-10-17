@@ -60,7 +60,8 @@ signin_files = {'SteamSignIn.swift', 'SteamSignInView.swift', 'SteamAuthAPI.swif
 # The owned library and downloads (docs/STEAM_LIBRARY.md). SteamError and SteamProtoMessages are shared.
 library_files = {'CMServerList.swift', 'LicenseListBox.swift', 'SteamCMSession.swift', 'SteamConnection.swift', 'SteamMessageCodec.swift',
                  'SteamProtocol.swift', 'SteamSession.swift', 'ContentDecryptor.swift', 'DepotDownloader.swift',
-                 'DepotManifest.swift', 'SteamAppInfo.swift', 'SteamLibraryFetcher.swift', 'AppManifestWriter.swift'}
+                 'DepotManifest.swift', 'SteamAppInfo.swift', 'SteamLibraryFetcher.swift', 'AppManifestWriter.swift',
+                 'SteamDownloadSources.swift'}
 shared_files = {'SteamError.swift', 'SteamProtoMessages.swift'}
 require(signin_files <= {f.name for f in files} <= signin_files | library_files,
         'SwiftSteam holds the sign-in files and, besides them, only the library files (check-steam-library.py lists those)')
@@ -104,7 +105,11 @@ import Foundation
 import FoundationNetworking
 #endif
 enum MadeiraConfig { static func get(_ key: String) -> String? { nil } }
-enum SteamLog { static func trace(_ m: @autoclosure () -> String) {}; static func event(_ m: String) {} }
+enum SteamLog {
+    nonisolated(unsafe) static var events: [String] = []
+    static func trace(_ m: @autoclosure () -> String) {}
+    static func event(_ m: String) { events.append(m) }
+}
 final class SteamTokenStore {
     struct StoredTokens { var accountName: String; var refreshToken: String; var accessToken: String; var steamID: UInt64; var savedAt: Date }
     static var saved: StoredTokens?
@@ -137,9 +142,13 @@ final class StubProtocol: URLProtocol {
     nonisolated(unsafe) static var lastURL: URL?
     nonisolated(unsafe) static var lastMethod: String?
     nonisolated(unsafe) static var lastBody: Data?
+    nonisolated(unsafe) static var networkErrors: [URLError.Code] = []
+    nonisolated(unsafe) static var requests = 0
+    nonisolated(unsafe) static var onNetworkError: (() -> Void)?
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
+        Self.requests += 1
         Self.lastURL = request.url; Self.lastMethod = request.httpMethod
         if let body = request.httpBody { Self.lastBody = body }
         else if let stream = request.httpBodyStream {
@@ -147,6 +156,12 @@ final class StubProtocol: URLProtocol {
             while stream.hasBytesAvailable { let n = stream.read(&buf, maxLength: buf.count); if n <= 0 { break }; data.append(buf, count: n) }
             stream.close(); Self.lastBody = data
         } else { Self.lastBody = nil }
+        if !Self.networkErrors.isEmpty {
+            let code = Self.networkErrors.removeFirst()
+            Self.onNetworkError?()
+            client?.urlProtocol(self, didFailWithError: URLError(code))
+            return
+        }
         var headers: [String: String] = [:]
         if let e = Self.eresult { headers["X-eresult"] = e }
         let response = HTTPURLResponse(url: request.url!, statusCode: Self.status, httpVersion: "HTTP/1.1", headerFields: headers)!
@@ -254,6 +269,54 @@ func expectError(_ expected: SteamError, _ label: String, _ run: () async throws
         require(form == "input_protobuf_encoded=%2B%2F8%3D", "body is the percent-encoded base64 protobuf (\(form))")
         _ = try await SteamAuthAPI.call("GetPasswordRSAPublicKey", body: Data([0xfb, 0xff]), httpMethod: "GET")
         require(StubProtocol.lastMethod == "GET" && StubProtocol.lastURL?.query == "input_protobuf_encoded=%2B%2F8%3D", "GET carries the protobuf in the query")
+
+        // Recover a transient break without abandoning the same poll session.
+        let privateBody = Data("synthetic-private-session".utf8)
+        StubProtocol.networkErrors = [.networkConnectionLost]
+        StubProtocol.requests = 0; SteamLog.events = []
+        let retried = try await SteamAuthAPI.call("PollAuthSessionStatus", body: privateBody)
+        require(retried == StubProtocol.body && StubProtocol.requests == 2, "one lost connection retries the poll once")
+        let privateEncoded = privateBody.base64EncodedString().addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        require(StubProtocol.lastBody == Data("input_protobuf_encoded=\(privateEncoded)".utf8), "poll retry preserves its session payload")
+        require(SteamLog.events.contains { $0.contains("method=PollAuthSessionStatus") && $0.contains("url--1005") }
+                && SteamLog.events.contains { $0.contains("attempt=2") && $0.contains("http=200") }, "diagnostics identify method, failure and recovery")
+        require(SteamLog.events.allSatisfy { !$0.contains("synthetic-private-session") && !$0.contains(privateEncoded) && !$0.contains("input_protobuf_encoded") }, "diagnostics omit private payload and URL query")
+
+        StubProtocol.networkErrors = [.networkConnectionLost]
+        StubProtocol.requests = 0
+        _ = try await SteamAuthAPI.call("GetPasswordRSAPublicKey", body: privateBody, httpMethod: "GET")
+        require(StubProtocol.requests == 2, "read-only RSA request retries once")
+        require(SteamLog.events.allSatisfy { !$0.contains(privateEncoded) && !$0.contains("input_protobuf_encoded") }, "RSA diagnostics omit the encoded account query")
+
+        StubProtocol.networkErrors = [.timedOut, .timedOut, .timedOut]
+        StubProtocol.requests = 0
+        do { _ = try await SteamAuthAPI.call("PollAuthSessionStatus", body: privateBody); require(false, "repeated timeout throws") }
+        catch let e as URLError { require(e.code == .timedOut && StubProtocol.requests == 2, "timeout has a bounded two-attempt budget") }
+        StubProtocol.networkErrors = []
+
+        for method in ["BeginAuthSessionViaCredentials", "UpdateAuthSessionWithSteamGuardCode", "BeginAuthSessionViaQR", "GenerateAccessTokenForApp"] {
+            StubProtocol.networkErrors = [.networkConnectionLost]; StubProtocol.requests = 0
+            do { _ = try await SteamAuthAPI.call(method, body: privateBody); require(false, method + " must throw") }
+            catch let e as URLError { require(e.code == .networkConnectionLost && StubProtocol.requests == 1, method + " is never automatically replayed") }
+        }
+        StubProtocol.networkErrors = [.cancelled]; StubProtocol.requests = 0
+        do { _ = try await SteamAuthAPI.call("PollAuthSessionStatus", body: privateBody); require(false, "cancelled transport throws") }
+        catch let e as URLError { require(e.code == .cancelled && StubProtocol.requests == 1, "cancelled transport is not retried") }
+
+        // Cancellation between attempts must not issue another request.
+        StubProtocol.networkErrors = [.networkConnectionLost]; StubProtocol.requests = 0
+        var startCancellationProbe: AsyncStream<Void>.Continuation!
+        let startSignal = AsyncStream<Void> { startCancellationProbe = $0 }
+        let cancelledPoll = Task {
+            for await _ in startSignal { break }
+            return try await SteamAuthAPI.call("PollAuthSessionStatus", body: privateBody)
+        }
+        StubProtocol.onNetworkError = { cancelledPoll.cancel() }
+        startCancellationProbe.yield(()); startCancellationProbe.finish()
+        do { _ = try await cancelledPoll.value; require(false, "cancelled retry throws") }
+        catch { require((error is CancellationError || (error as? URLError)?.code == .cancelled) && StubProtocol.requests == 1, "cancel stops the retry before any new request") }
+        StubProtocol.onNetworkError = nil; StubProtocol.networkErrors = []
+
         StubProtocol.eresult = "5"
         await expectError(.invalidCredentials, "HTTP 200 with x-eresult 5 is a wrong password") { try await SteamAuthAPI.call("X", body: Data()) }
         StubProtocol.eresult = nil; StubProtocol.status = 429

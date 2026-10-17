@@ -37,7 +37,7 @@ require('SteamSignIn.flag("MADEIRA_STEAM_CLOUD", default: true)' in owned,
 require('guard let state = cloud[appID] else { return .stale }' in owned,
         'Play on a game not checked yet in this app run syncs it first, without asking')
 upload = owned[owned.index('private func upload(_ appID: Int'):owned.index('// MARK: Before Play')]
-require(upload.index('cloudFile(appID, entry)') < upload.index('.cloudBeginAppUploadBatch'),
+require(upload.index('cloudFile(appID, entry, identity: identity)') < upload.index('.cloudBeginAppUploadBatch'),
         "an upload fetches the cloud's copy of every file it replaces before the batch opens")
 require('appendingPathComponent("cloud", isDirectory: true)' in upload,
         "the cloud's copies go to the backup's cloud/ folder")

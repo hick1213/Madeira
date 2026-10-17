@@ -1303,7 +1303,7 @@ void main_loop(void)
         while (active_users)
         {
             /* Check stop flag */
-            if (g_wineserver_should_stop)
+            if (__atomic_load_n(&g_wineserver_should_stop, __ATOMIC_ACQUIRE))
             {
                 ws_log("[wineserver-fd] LOOP EXIT: stop requested at iter=%d", ios_iter);
                 break;

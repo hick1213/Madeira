@@ -8,6 +8,8 @@
 #import <stdarg.h>
 
 #include "WineServerBridge.h"
+#include "RuntimeFonts.h"
+#include <errno.h>
 #include <sys/time.h>
 
 static FILE *g_ws_bridge_log = NULL;
@@ -67,11 +69,8 @@ extern int debug_level;
 // Stop flag checked by wineserver event loop (fd_ios.c)
 volatile int g_wineserver_should_stop = 0;
 
-static pthread_t g_wineserver_thread;
-static volatile int g_wineserver_running = 0;
-static char *g_prefix_path = NULL;
-
-static void *wineserver_thread_func(void *arg) {
+static void *wineserver_thread_body(void *arg) {
+    const char *prefix_path = arg;
     @autoreleasepool {
         // Set up file-based logging
         NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
@@ -99,13 +98,13 @@ static void *wineserver_thread_func(void *arg) {
         wine_log_msg("Wineserver thread started");
 
         // Set up environment for wineserver
-        setenv("WINEPREFIX", g_prefix_path, 1);
-        setenv("HOME", g_prefix_path, 1);  // Fallback if WINEPREFIX not used
+        setenv("WINEPREFIX", prefix_path, 1);
+        setenv("HOME", prefix_path, 1);  // Fallback if WINEPREFIX not used
 
-        wine_log_msg("WINEPREFIX=%s", g_prefix_path);
+        wine_log_msg("WINEPREFIX=%s", prefix_path);
 
         // Create the Wine prefix directory if it doesn't exist
-        mkdir(g_prefix_path, 0755);
+        mkdir(prefix_path, 0755);
 
         // Tell wineserver where NLS files are (inside the app bundle)
         NSString *nlsDir = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"nls"];
@@ -124,21 +123,141 @@ static void *wineserver_thread_func(void *arg) {
         int ret = wineserver_main(argc, argv);
         wine_log_msg("wineserver_main returned: %d", ret);
 
-        g_wineserver_running = 0;
     }
     return NULL;
 }
 
-int wineserver_start(const char *prefix_path) {
-    if (g_wineserver_running) {
-        wine_log_msg("Wineserver already running");
-        return 0;
+static void madeira_prepare_cjk_fonts(const char *prefix_path) {
+    @autoreleasepool {
+        // This is the sole offline registry window. The prefix seed is also
+        // called later by Wine, so font migration must remain here, before
+        // this owned wineserver thread loads system.reg.
+        NSError *fontError = nil;
+        NSString *fontResources = [[[[NSBundle mainBundle] resourcePath] stringByAppendingPathComponent:@"cjk-fonts"] stringByResolvingSymlinksInPath];
+        NSString *fontPrefix = [[NSString stringWithUTF8String:prefix_path] stringByStandardizingPath];
+        NSString *home = [NSHomeDirectory() stringByStandardizingPath];
+        if ([fontPrefix hasPrefix:[home stringByAppendingString:@"/"]]) {
+            // Canonicalize only trusted container ancestry (/var on iOS),
+            // retaining prefix components for the helper's no-symlink checks.
+            fontPrefix = [[home stringByResolvingSymlinksInPath] stringByAppendingPathComponent:
+                [fontPrefix substringFromIndex:home.length + 1]];
+        }
+        if (!madeira_seed_cjk_fonts(fontPrefix.fileSystemRepresentation, fontResources.fileSystemRepresentation,
+                "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b", &fontError)) {
+            wine_log_msg("[fonts-cjk] preparation failed: %s", fontError.localizedDescription.UTF8String ?: "unknown error");
+        } else {
+            wine_log_msg("[fonts-cjk] Noto Sans CJK SC font and fallback ready");
+        }
     }
+}
 
-    // Store prefix path
-    if (g_prefix_path) free(g_prefix_path);
-    g_prefix_path = strdup(prefix_path);
+/* IOS_WINESERVER_LIFECYCLE_BEGIN */
+static pthread_mutex_t g_wineserver_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_wineserver_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t g_wineserver_thread;
+static int g_wineserver_thread_valid;
+static int g_wineserver_starting;
+static int g_wineserver_joining;
+static int g_wineserver_running;
+static unsigned long long g_wineserver_generation;
 
+extern int wineserver_ready;
+extern void ios_wineserver_wake(void);
+
+static void wineserver_thread_cleanup(void *arg) {
+    free(arg); /* one immutable prefix allocation owned by this session */
+    pthread_mutex_lock(&g_wineserver_mutex);
+    __atomic_store_n(&wineserver_ready, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_wineserver_running, 0, __ATOMIC_RELEASE);
+    pthread_cond_broadcast(&g_wineserver_cond);
+    pthread_mutex_unlock(&g_wineserver_mutex);
+}
+
+static void *wineserver_thread_func(void *arg) {
+    /* fatal_error uses pthread_exit, so normal-return-only cleanup is not
+     * enough. Joinability remains until exactly one owner reaps the thread. */
+    pthread_cleanup_push(wineserver_thread_cleanup, arg);
+    wineserver_thread_body(arg);
+    pthread_cleanup_pop(1);
+    return NULL;
+}
+
+/* The caller owns g_wineserver_joining. Never hold the lifecycle mutex during
+ * pthread_join: the finishing thread needs it to publish its cleanup. */
+static int wineserver_finish_join(pthread_t thread, unsigned long long generation) {
+    wine_log_msg("Joining wineserver thread (generation %llu, running=%d ready=%d)",
+                 generation,
+                 __atomic_load_n(&g_wineserver_running, __ATOMIC_ACQUIRE),
+                 __atomic_load_n(&wineserver_ready, __ATOMIC_ACQUIRE));
+    int error = pthread_join(thread, NULL);
+    pthread_mutex_lock(&g_wineserver_mutex);
+    if (g_wineserver_generation == generation) {
+        if (!error) {
+            g_wineserver_thread_valid = 0;
+            g_wineserver_thread = (pthread_t)0;
+            __atomic_store_n(&wineserver_ready, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_wineserver_running, 0, __ATOMIC_RELEASE);
+        }
+        /* A failed join retains ownership of the joinable thread; a later
+         * background call may retry, but no new server can overwrite it. */
+        g_wineserver_joining = 0;
+    }
+    pthread_cond_broadcast(&g_wineserver_cond);
+    pthread_mutex_unlock(&g_wineserver_mutex);
+    if (error) wine_log_msg("Wineserver join failed: %d", error);
+    else wine_log_msg("Wineserver thread joined (generation %llu)", generation);
+    return error ? -1 : 0;
+}
+
+int wineserver_start(const char *prefix_path) {
+    char *owned_prefix;
+    unsigned long long generation;
+    int main_thread = pthread_main_np();
+    if (!prefix_path || !*prefix_path) return -1;
+    pthread_mutex_lock(&g_wineserver_mutex);
+    for (;;) {
+        if (g_wineserver_thread_valid && pthread_equal(g_wineserver_thread, pthread_self())) {
+            int active = !g_wineserver_joining &&
+                         !__atomic_load_n(&g_wineserver_should_stop, __ATOMIC_ACQUIRE);
+            pthread_mutex_unlock(&g_wineserver_mutex);
+            return active ? 0 : -1; /* never wait on an owner joining ourselves */
+        }
+        if (g_wineserver_starting || g_wineserver_joining) {
+            if (main_thread) {
+                pthread_mutex_unlock(&g_wineserver_mutex);
+                return -1; /* UIKit must never wait for a previous session */
+            }
+            pthread_cond_wait(&g_wineserver_cond, &g_wineserver_mutex);
+            continue;
+        }
+        if (!g_wineserver_thread_valid) break;
+        if (__atomic_load_n(&g_wineserver_running, __ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&g_wineserver_should_stop, __ATOMIC_ACQUIRE)) {
+            pthread_mutex_unlock(&g_wineserver_mutex);
+            return 0;
+        }
+        if (main_thread || pthread_equal(g_wineserver_thread, pthread_self())) {
+            pthread_mutex_unlock(&g_wineserver_mutex);
+            return -1;
+        }
+        pthread_t previous = g_wineserver_thread;
+        unsigned long long previous_generation = g_wineserver_generation;
+        g_wineserver_joining = 1;
+        pthread_mutex_unlock(&g_wineserver_mutex);
+        if (wineserver_finish_join(previous, previous_generation)) return -1;
+        pthread_mutex_lock(&g_wineserver_mutex);
+    }
+    owned_prefix = strdup(prefix_path);
+    if (!owned_prefix) {
+        pthread_mutex_unlock(&g_wineserver_mutex);
+        return -1;
+    }
+    g_wineserver_starting = 1;
+    generation = ++g_wineserver_generation;
+    __atomic_store_n(&g_wineserver_should_stop, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&wineserver_ready, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_wineserver_running, 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_wineserver_mutex);
     wine_log_msg("Starting wineserver with prefix: %s", prefix_path);
 
     /* ml588: seed the prefix BEFORE the server thread starts. init_registry()
@@ -148,14 +267,9 @@ int wineserver_start(const char *prefix_path) {
      * idempotent, so this costs one stat() on every launch after the first. */
     {
         extern void madeira_seed_prefix_if_needed(const char *prefix_path);
-        madeira_seed_prefix_if_needed(prefix_path);
+        madeira_seed_prefix_if_needed(owned_prefix);
+        madeira_prepare_cjk_fonts(owned_prefix);
     }
-
-    {
-        extern int wineserver_ready;
-        __atomic_store_n(&wineserver_ready, 0, __ATOMIC_RELEASE);
-    }
-    g_wineserver_running = 1;
 
     /* 2026-07-04 perf: the wineserver thread used to be created at LOWERED
      * priority (sched_priority 20, "so wineserver doesn't starve the main
@@ -167,41 +281,84 @@ int wineserver_start(const char *prefix_path) {
      * object wait / message pump call — it must run AT LEAST as hot as its
      * clients. */
     pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
-
-    int ret = pthread_create(&g_wineserver_thread, &attr, wineserver_thread_func, NULL);
-    pthread_attr_destroy(&attr);
-    if (ret != 0) {
+    int ret = pthread_attr_init(&attr);
+    int attr_initialized = !ret;
+    if (!ret) pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_mutex_lock(&g_wineserver_mutex);
+    /* stop() may have arrived during prefix seeding. Do not create a new
+     * thread after that request; its background caller is waiting on starting. */
+    if (!ret && !__atomic_load_n(&g_wineserver_should_stop, __ATOMIC_ACQUIRE)) {
+        pthread_t thread = (pthread_t)0;
+        ret = pthread_create(&thread, &attr, wineserver_thread_func, owned_prefix);
+        if (!ret) {
+            g_wineserver_thread = thread;
+            g_wineserver_thread_valid = 1;
+        }
+    } else if (!ret) {
+        ret = ECANCELED;
+    }
+    g_wineserver_starting = 0;
+    if (ret) {
+        __atomic_store_n(&wineserver_ready, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_wineserver_running, 0, __ATOMIC_RELEASE);
+    }
+    pthread_cond_broadcast(&g_wineserver_cond);
+    pthread_mutex_unlock(&g_wineserver_mutex);
+    /* attr is initialized unless pthread_attr_init itself failed. */
+    if (attr_initialized) pthread_attr_destroy(&attr);
+    if (ret) {
+        free(owned_prefix);
         wine_log_msg("Failed to create wineserver thread: %d", ret);
-        g_wineserver_running = 0;
         return -1;
     }
-
-    // Don't detach — wineserver_stop() will join to ensure clean shutdown
-    wine_log_msg("Wineserver thread created");
+    wine_log_msg("Wineserver thread created (generation %llu)", generation);
     return 0;
 }
 
 int wineserver_is_running(void) {
-    return g_wineserver_running;
+    return __atomic_load_n(&g_wineserver_running, __ATOMIC_ACQUIRE);
 }
 
 int wineserver_is_ready(void) {
-    extern int wineserver_ready;
-    return __atomic_load_n(&wineserver_ready, __ATOMIC_ACQUIRE);
+    return wineserver_is_running() &&
+           !__atomic_load_n(&g_wineserver_should_stop, __ATOMIC_ACQUIRE) &&
+           __atomic_load_n(&wineserver_ready, __ATOMIC_ACQUIRE);
 }
 
 void wineserver_stop(void) {
+    unsigned long long generation;
+    pthread_t thread;
     wine_log_msg("Wineserver stop requested");
-    g_wineserver_should_stop = 1;
-    // Join the wineserver thread to ensure it actually stops before we return.
-    // This prevents iOS from killing us for excessive CPU from a spinning wineserver.
-    pthread_t t = g_wineserver_thread;
-    if (t) {
-        wine_log_msg("Joining wineserver thread...");
-        pthread_join(t, NULL);
-        wine_log_msg("Wineserver thread joined");
+    pthread_mutex_lock(&g_wineserver_mutex);
+    if (!g_wineserver_starting && !g_wineserver_thread_valid) {
+        pthread_mutex_unlock(&g_wineserver_mutex);
+        return;
     }
-    g_wineserver_running = 0;
+    generation = g_wineserver_generation;
+    __atomic_store_n(&g_wineserver_should_stop, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&wineserver_ready, 0, __ATOMIC_RELEASE);
+    if (pthread_main_np() ||
+        (g_wineserver_thread_valid && pthread_equal(g_wineserver_thread, pthread_self()))) {
+        pthread_mutex_unlock(&g_wineserver_mutex);
+        ios_wineserver_wake();
+        return; /* signal-only on UIKit/the server itself; no blocking join */
+    }
+    while (g_wineserver_starting && generation == g_wineserver_generation)
+        pthread_cond_wait(&g_wineserver_cond, &g_wineserver_mutex);
+    if (generation != g_wineserver_generation || !g_wineserver_thread_valid) {
+        pthread_mutex_unlock(&g_wineserver_mutex);
+        return;
+    }
+    if (g_wineserver_joining) {
+        while (g_wineserver_joining && generation == g_wineserver_generation)
+            pthread_cond_wait(&g_wineserver_cond, &g_wineserver_mutex);
+        pthread_mutex_unlock(&g_wineserver_mutex);
+        return; /* another stop/start owns this exact generation's join */
+    }
+    g_wineserver_joining = 1;
+    thread = g_wineserver_thread;
+    pthread_mutex_unlock(&g_wineserver_mutex);
+    ios_wineserver_wake();
+    wineserver_finish_join(thread, generation);
 }
+/* IOS_WINESERVER_LIFECYCLE_END */

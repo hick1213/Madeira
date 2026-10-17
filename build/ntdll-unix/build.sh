@@ -9,6 +9,23 @@ SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 OBJ_DIR="$BUILD_DIR/obj"
 APP_LIB="$REPO_ROOT/app/Madeira/libntdll_unix.a"
 
+for input in "$WINE_BUILD/include/config.h" "$WINE_BUILD/include/dwrite.h" \
+             "$WINE_BUILD/include/dwrite_3.h" "$WINE_BUILD/include/mfobjects.h" \
+             "$WINE_BUILD/include/mftransform.h"; do
+    [ -s "$input" ] || { echo "ERROR: missing Wine config/header $input; configure wine/build-macos with --enable-archs=none and run make include/all (bison >= 3)" >&2; exit 1; }
+done
+for setting in HAVE_GNUTLS_CIPHER_INIT SONAME_LIBGNUTLS; do
+    grep -q "^#define $setting " "$WINE_BUILD/include/config.h" || \
+        { echo "ERROR: Wine config must enable $setting for the static iOS GnuTLS stack" >&2; exit 1; }
+done
+for input in "$REPO_ROOT/toolchains/gnutls-ios/include/gnutls/gnutls.h" \
+             "$REPO_ROOT/toolchains/gnutls-ios/lib/libgnutls.a" \
+             "$REPO_ROOT/toolchains/ffmpeg-ios/include/libavcodec/avcodec.h" \
+             "$REPO_ROOT/research/freetype/include/ft2build.h" \
+             "$REPO_ROOT/build/freetype-ios/build/libfreetype.a"; do
+    [ -s "$input" ] || { echo "ERROR: missing $input; build GnuTLS, FFmpeg and FreeType before native Wine" >&2; exit 1; }
+done
+
 mkdir -p "$OBJ_DIR"
 
 SUCCEEDED=0
@@ -87,6 +104,7 @@ echo "=== Building ntdll unix (iOS) ==="
 # IAudioClock that advances at real time so FMOD's audio-gated rhythm
 # logic in Thumper et al. advances past intro music.
 compile_one "$BUILD_DIR/audio_null_ios.c" "audio_null_ios"
+compile_one "$BUILD_DIR/ios_native_lifetime.c" "ios_native_lifetime"
 compile_one "$BUILD_DIR/../madsync/madsync.c" "madsync"   # ml1058: userspace ntsync
 
 # iOS-Madeira 2026-07-05 (Steam S0): network + crypto unix sides.
@@ -177,6 +195,12 @@ for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
         server)
             compile_one "$BUILD_DIR/server_ios.c" "server"
             ;;
+        sync)
+            compile_one "$BUILD_DIR/sync_ios.c" "sync"
+            ;;
+        file)
+            compile_one "$BUILD_DIR/file_ios.c" "file"
+            ;;
         env)
             compile_one "$BUILD_DIR/env_ios.c" "env"
             ;;
@@ -203,10 +227,15 @@ echo "Results: $SUCCEEDED succeeded, $FAILED failed"
 if [ -n "$FAILED_FILES" ]; then
     echo "Failed:$FAILED_FILES"
 fi
+if [ "$FAILED" -gt 0 ]; then
+    echo "ERROR: not archiving; see $OBJ_DIR/<name>.err" >&2
+    exit 1
+fi
 
 echo ""
 echo "=== Building libntdll_unix.a ==="
 ar rcs "$OBJ_DIR/libntdll_unix.a" \
+    "$OBJ_DIR/ios_native_lifetime.o" \
     "$OBJ_DIR/audio_null_ios.o" "$OBJ_DIR/madsync.o" "$OBJ_DIR/nsi_unixlib_ios.o" \
     "$OBJ_DIR/nsi_network_ios.o" "$OBJ_DIR/nsi_ndis.o" "$OBJ_DIR/nsi_ip.o" \
     "$OBJ_DIR/gnutls_symtab_ios.o" "$OBJ_DIR/ws2_32_unixlib.o" \

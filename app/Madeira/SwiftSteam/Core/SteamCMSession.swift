@@ -26,3 +26,16 @@ protocol SteamCMSession: AnyObject {
     /// Calls a unified-service method and returns the response body.
     func callServiceMethod(method: SteamServiceMethod, body: Data, timeout: TimeInterval) async throws -> Data
 }
+
+extension SteamCMSession {
+    /// The authenticated CM route does not depend on the public Web API host.
+    func contentDirectory(cellID: UInt32, ipOverride: String?) async throws -> Data {
+        try Task.checkCancellation()
+        try await ensureConnected()
+        try Task.checkCancellation()
+        let data = try await callServiceMethod(method: .getContentServers,
+            body: SteamContentDirectoryMessage.request(cellID: cellID, ipOverride: ipOverride), timeout: 8)
+        try Task.checkCancellation()
+        return try SteamContentDirectoryMessage.response(data)
+    }
+}

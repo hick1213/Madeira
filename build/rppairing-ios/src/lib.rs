@@ -20,7 +20,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use idevice::remote_pairing::{PairableHost, PairableHostInfo, RpPairingFile, RpPairingSocket};
+use idevice::remote_pairing::{PairableHost, PairableHostInfo, PeerDevice, RpPairingFile, RpPairingSocket};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
@@ -65,6 +65,36 @@ fn set_error(out: *mut *mut c_char, message: impl Into<Vec<u8>>) {
     if !out.is_null() {
         unsafe { *out = CString::new(message).unwrap_or_default().into_raw() };
     }
+}
+
+/// Checks that a Remote Pairing Bonjour advertisement belongs to the paired
+/// device. Returns 1 for a match, 0 for invalid inputs or a different device.
+/// Uses idevice's peer matcher; no pairing keys or TXT records are logged.
+///
+/// # Safety
+/// Non-NULL `alt_irk` must point to `alt_irk_len` readable bytes. Non-NULL
+/// `identifier` and `auth_tag` must be readable NUL-terminated strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn madeira_rppairing_validate_auth_tag(
+    alt_irk: *const u8,
+    alt_irk_len: usize,
+    identifier: *const c_char,
+    auth_tag: *const c_char,
+) -> i32 {
+    if alt_irk.is_null() || alt_irk_len != 16 || identifier.is_null() || auth_tag.is_null() {
+        return 0;
+    }
+    let (Ok(identifier), Ok(auth_tag)) = (
+        unsafe { CStr::from_ptr(identifier) }.to_str(),
+        unsafe { CStr::from_ptr(auth_tag) }.to_str(),
+    ) else {
+        return 0;
+    };
+    if identifier.is_empty() || identifier.len() > 255 || auth_tag.len() != 8 {
+        return 0;
+    }
+    let alt_irk = unsafe { std::slice::from_raw_parts(alt_irk, alt_irk_len) };
+    i32::from(PeerDevice::validate_auth_tag(alt_irk, identifier, auth_tag))
 }
 
 /// Generates a fresh host identity and binds a TCP listener on all IPv4
@@ -334,6 +364,52 @@ mod tests {
     use std::net::TcpStream;
     use std::thread;
     use std::time::Duration;
+
+    // Official idevice PeerDevice::validate_auth_tag interoperability vector.
+    const PEER_IRK: [u8; 16] = [
+        0x32, 0x0a, 0x7a, 0x64, 0x63, 0xf3, 0x5c, 0xcd,
+        0xa4, 0xbb, 0xd6, 0xeb, 0xe3, 0xab, 0xec, 0x8b,
+    ];
+
+    fn matches_peer(irk: &[u8], identifier: &CStr, tag: &CStr) -> i32 {
+        unsafe {
+            madeira_rppairing_validate_auth_tag(irk.as_ptr(), irk.len(), identifier.as_ptr(), tag.as_ptr())
+        }
+    }
+
+    #[test]
+    fn peer_auth_tag_matches_upstream_vector_and_rejects_other_peers() {
+        let identifier = c"2BE6E510-0325-4365-923E-B14C6F57DB3A";
+        assert_eq!(matches_peer(&PEER_IRK, identifier, c"kXjlTr2l"), 1);
+        let mut other = PEER_IRK;
+        other[0] ^= 1;
+        assert_eq!(matches_peer(&other, identifier, c"kXjlTr2l"), 0);
+        assert_eq!(matches_peer(&PEER_IRK, c"other-device", c"kXjlTr2l"), 0);
+        assert_eq!(matches_peer(&PEER_IRK, identifier, c"kXjlTr2m"), 0);
+    }
+
+    #[test]
+    fn peer_auth_tag_rejects_nulls_lengths_and_malformed_txt() {
+        let identifier = c"2BE6E510-0325-4365-923E-B14C6F57DB3A";
+        let tag = c"kXjlTr2l";
+        unsafe {
+            assert_eq!(madeira_rppairing_validate_auth_tag(ptr::null(), 16, identifier.as_ptr(), tag.as_ptr()), 0);
+            assert_eq!(madeira_rppairing_validate_auth_tag(PEER_IRK.as_ptr(), 16, ptr::null(), tag.as_ptr()), 0);
+            assert_eq!(madeira_rppairing_validate_auth_tag(PEER_IRK.as_ptr(), 16, identifier.as_ptr(), ptr::null()), 0);
+        }
+        for irk in [&PEER_IRK[..0], &PEER_IRK[..15], &[0u8; 17][..]] {
+            assert_eq!(matches_peer(irk, identifier, tag), 0);
+        }
+        assert_eq!(matches_peer(&PEER_IRK, c"", tag), 0);
+        for malformed in [c"", c"!XjlTr2l", c"YWJj", c"YWJjZGVmZw=="] {
+            assert_eq!(matches_peer(&PEER_IRK, identifier, malformed), 0);
+        }
+        let bad_utf8 = CStr::from_bytes_with_nul(b"\xff\0").unwrap();
+        assert_eq!(matches_peer(&PEER_IRK, bad_utf8, tag), 0);
+        assert_eq!(matches_peer(&PEER_IRK, identifier, bad_utf8), 0);
+        let oversized = CString::new("a".repeat(256)).unwrap();
+        assert_eq!(matches_peer(&PEER_IRK, &oversized, tag), 0);
+    }
 
     struct Session(*mut MadeiraRPPairing);
     unsafe impl Send for Session {}

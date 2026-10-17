@@ -1,5 +1,62 @@
 # Library front end
 
+Last updated: 2026-10-15.
+
+Before Play, the shared launch path checks declared .NET dependencies for Steam,
+Epic and imported games. Game details also offers **运行环境 › 检查运行环境**.
+The explicit check opens a local dependency report without requesting the
+before-play Steam Cloud synchronization or consuming a one-use Cloud decision.
+Inspection reports offer finish/close rather than starting a game; normal Play
+retains its existing Cloud and launch guards.
+Missing supported modern .NET x86/x64 runtimes expose **一键修复**, which checks
+Microsoft's official installer SHA-512 before starting a dedicated installer
+session. Completion requires a matching receipt and a fresh scan; restart Madeira
+before playing after repair. Unknown/custom DLL requirements and legacy .NET
+Framework do not get automatic downloads. Directory URL spelling is normalized
+so a trailing slash cannot invalidate the repair plan. Actual installer
+completion and game compatibility still require a user-operated retry.
+See [verification evidence](../issue/epic-retry-20261015/bg3-runtime-repair/STATUS.json).
+
+The installer launch entry uses the same lexical `/var` to `/private/var`
+normalization as repair plan binding. It requires the exact current drive and
+task directory and retains file-identity/hash validation before Wine. App55's
+actual UI-prefix regression covers both protected aliases; its build, signing
+and package checks pass. App55 was installed and its official installer started,
+but its 32-bit bootstrapper hit a GDI initialization fault before installation.
+
+The installer-only profile now enables the existing section-backed GDI table
+before its 64-bit session starts, allowing the 32-bit bootstrapper to map it.
+Native repair progress shows the current package, ended package count and elapsed
+time. **查看 Windows 画面** hides the sheet without stopping installation;
+**修复进度** opens it again. While installing, both live in the controls window
+above the Windows surface, replacing the generic game starting HUD. Receipt
+reads are bounded, read-only and tied to the
+original plan and file identities. They do not repeatedly hash installers or
+infer a percentage. Even a complete receipt waits for Wine and its server to
+stop, then requires exit-code verification and a fresh dependency scan.
+The App56 retry completed all four Microsoft MSI packages, and the next actual
+launch's dependency scan passed. Its installer session then crashed during
+thread cleanup: a cross-process TEB handoff released a guest stack using the
+freeing thread's window. The next game attempt reached LariLauncher with.NET
+6.0.36, but stalled before spawning BG3; its generated code hit a CAS alias
+handler restricted to the main code pool.
+
+App57 uses the target TEB's window for stack release and permits CAS only with
+full coverage in an existing, matching anonymous writable alias. The existing
+atomic operation and common instruction-advance path are retained. Host checks,
+package/signature verification and retained asset hashes pass. Fresh device
+launch and native progress visuals remain separate validation. See
+[App57 evidence](../issue/epic-retry-20261015/bg3-runtime-repair/native57-STATUS.json).
+
+App47 adds the missing Chinese glyph font for Windows dialogs. The bundled
+Noto Sans CJK SC2.004 font is validated and installed before the Wine server
+starts, with an additive fallback for Tahoma, Microsoft Sans Serif and Segoe UI.
+Existing fonts, language and custom links are retained. The original system.reg
+is backed up once before an atomic update; repeated starts do not rewrite it.
+An already-running Wine session must be restarted to load these fonts. Local
+migration tests and packaging pass; actual iPad text rendering requires a fresh
+user-operated session.
+
 Madeira starts in a game library. The original diagnostic screen (the
 "developer interface") is still there: **Settings › Interface › Use developer
 interface** switches to it, and its **Use New Interface** button switches back.
@@ -74,7 +131,9 @@ Removing an entry never removes the game's files or saves.
 - **Settings**: JIT and memory status, Enable JIT, JIT method and setup
   (StikDebug or the built-in helper), extended logging, pointer
   mode (Absolute, Relative or Touch) and touch sensitivity, **Display** (hold
-  the display at its maximum rate, off by default), **Memory & sync** (swap tier
+  the display at its maximum rate, off by default), **Performance information**
+  (the global game overlay, below), **iCloud Drive › Local game saves**
+  (manual, configured local-game backups), **Memory & sync** (swap tier
   Off/1/2/4 GB, off by default; sync engine, Fastsync by default), the interface
   switch and **Credits** (the last section). Display applies from the next session or FPS limit change; Memory &
   sync after a restart. They write `env.MADEIRA_PROMOTE`, `swap-mb`,
@@ -91,6 +150,50 @@ Removing an entry never removes the game's files or saves.
   cap, checked when a block is backed).
   Without the key, `swap-mode = 2` in madeira.cfg means broad and the picker
   shows it; choosing large allocations then writes `classic` explicitly.
+
+## Performance information
+
+Open the library's **Settings › Performance information** and enable **Show
+performance information**. It is off by default. This one setting and its
+selected fields apply at the next launch to all library games, including Steam,
+Epic and manually added games, and to the Desktop. Game details also has
+**Performance information (all games)**, which opens the same global settings.
+
+The default fields are **FPS**, **Frame time** and **RAM**. **CPU**, **GPU**,
+**Battery** and **Thermal** are optional; at least one field must stay selected.
+The floating overlay can still be dragged, and its position is remembered.
+
+The measurements describe Madeira's runtime, with these limits:
+
+- **FPS** counts submitted game-output frames from the WMT presentation counter.
+  It does not count frame-generation interpolation or measure the screen's
+  refresh rate. **Frame time** is the average interval between those submissions,
+  rather than a single frame's CPU or GPU render time.
+- **CPU** covers the entire Madeira process. Its total is normalized across the
+  available CPU cores; **top** is the busiest sampled thread's share of one core.
+  **RAM** is Madeira's physical memory footprint, including the runtime.
+- **GPU** estimates this app's command-buffer busy time during the sample, with
+  busy time per submitted frame where available. It is not system-wide GPU
+  utilization. **Battery** is the device's reported charge; **Thermal** shows
+  Cool, Warm, Hot or Critical.
+
+Sampling uses a monotonic clock. Returning to the foreground establishes a new
+baseline so time spent in the background does not distort the frame rate.
+Unavailable measurements show **—**.
+
+The in-game menu can temporarily change visibility and fields for that session.
+The next launch reads the global defaults again. These changes write neither
+the global defaults nor a game's old `performance` and `overlayFields` values;
+those legacy profile fields remain readable and preserved, but no longer select
+the overlay at launch.
+
+The implementation is `app/Madeira/PerformanceOverlay.swift` plus
+`LibraryModel.configurePerformanceOverlay()` and `LibraryMetrics` in
+`Library.swift`. Focused production-code checks and independent review passed,
+and 0.1.3/build15 compiled, passed IPA, signature and resource checks, and was
+installed and launched on Fang Dong's M5 iPad. Actual overlay appearance,
+dragging, foreground transitions and game counters still require device
+validation; a successful app launch does not establish those interactions.
 
 ## Game details
 
@@ -151,7 +254,10 @@ and check-frontend fails if a setting is hidden from it. A profile holds:
 - **AVX and AVX2**: off by default, as in FEX's iOS build; only an explicit
   choice exports `MADEIRA_FEX_AVX=1`, which makes the ARM64EC FEX module report
   and emulate AVX/AVX2 for a game built for AVX processors (64-bit games; WOW64
-  has no AVX);
+  has no AVX). They are CPU instruction extensions, not a general speed switch.
+  Leave them off for a game that already works; enable them per game when its
+  instruction requirements call for AVX. An illegal-instruction error alone
+  does not establish that AVX is the missing instruction;
 - **CPU cores reported** (Automatic, 1, 2, 4 or 6) and **D3D9 anisotropic
   filtering** (Application default, up to 1×, 2×, 4× or 8×): only a choice
   other than the default exports `MADEIRA_CPU_COUNT` (wine) or
@@ -170,7 +276,7 @@ and check-frontend fails if a setting is hidden from it. A profile holds:
   window flags) and the command line the next start runs (with a **Launch**
   choice above, what starts the program: explorer.exe or cmd.exe with its
   whole command);
-- performance overlay, live logs and touch controls for the session, with the
+- live logs and touch controls for the session, with the
   controls' **opacity** and overall **size**. The touch layout itself is saved
   per game from the in-game editor;
 - **Advanced › This game's config**: lines in madeira.cfg's syntax for this
@@ -236,6 +342,23 @@ entry goes with **Uninstall**).
 
 ## Sessions
 
+From build16, launch preparation and the running session pause optional
+background work through `GameSessionWork`: Steam and Epic game downloads,
+catalog/library metadata refreshes, installation-folder scans and the hidden
+JIT-status polling used outside a session. Both Wine and its server must actually
+stop before waiting work resumes, including after a failed launch or a quick
+exit. Folder scans cooperate with cancellation rather than merely hiding their
+results. This is internal work scheduling, not proof that iOS system Game Mode
+has been activated.
+
+Rendering, audio, input, the active JIT attachment, library session monitoring,
+Dock session reports and performance-overlay sampling continue during the game.
+Already manually paused downloads stay paused. Host production-code checks and
+Steam/Epic regressions passed; game-start/download pause/resume behavior still
+needs verification on the iPad. Build16 is the current local IPA and passed
+package/signature/resource validation; the iPad still has build15. Build16
+installation remains pending at this checkpoint.
+
 Play applies the profile and runs the same `runWineFullSequence` as the
 developer interface's buttons. The game is shown full screen in either
 orientation. A starting screen with the game's cover stays until the first
@@ -256,9 +379,9 @@ in-game menu:
 2. the FPS limit, **Aspect & scaling**, **Eco mode** (the developer overlay's
    ECO pill: guest threads at a low priority while it is on), and the mouse and
    pointer settings;
-3. the performance overlay and its fields (FPS, average frame time, CPU load
-   with the busiest thread, GPU load with GPU time per frame, memory
-   footprint, battery, and the thermal state: Cool, Warm, Hot or Critical; a
+3. the performance overlay and its fields (the measurements described in
+   **Performance information** above; thermal states are Cool, Warm, Hot or
+   Critical; a
    change is logged as `[thermal]` while the overlay is shown), then
    **Diagnostics**: **Capture the next frame** and **GPU sync** F1/F6/F5/F0,
    the developer overlay's CAP and F pills, for Direct3D 12 games (shown only with
@@ -266,8 +389,9 @@ in-game menu:
 4. **Quit game** in red. Quit asks the program to close with Alt+F4 through
    the normal input queue, so it can save; the session ends when it exits.
 
-Changes made in the menu (FPS limit, Aspect & scaling, controls, overlay) are
-saved to the game's profile.
+Changes made in the menu to the FPS limit, Aspect & scaling and controls are
+saved to the game's profile. Overlay visibility and fields apply only to the
+current session; the next launch uses the global performance settings.
 
 **Pointer modes.** Absolute drags the pointer like a trackpad, Relative sends
 finger movement as mouse movement (mouse-look), and **Touch** clicks where the
@@ -290,6 +414,24 @@ One Wine session runs per app run: a second one cannot start in the same
 process (the wineserver's permanent objects from the first session remain and
 the registry initialisation aborts). The library asks to restart Madeira
 instead.
+
+## Local-game cloud saves
+
+Build16 adds **Settings › iCloud Drive › Local game saves** for manually imported
+games. Choose a dedicated folder through Files, then explicitly configure each
+game's own save directory by picker or Windows `C:\` path. Upload and download
+are manual and require confirmation. A restore keeps an original local backup
+in **Files › Madeira › iCloud Save Backups** and preserves local files absent
+from the cloud version. A game without a configured save directory is not
+automatically scanned or restored.
+
+The Files provider performs the final transfer. A backup written to its folder
+is not called uploaded unless iCloud reports that status. Steam and Epic entries
+are excluded; Steam Cloud keeps its existing handling, and Epic Cloud remains
+unsupported. Registry-only saves are not included. See
+[Local-game iCloud save guide](LOCAL_SAVE_CLOUD.md) for folder rules, limits,
+confirmation and cross-device steps. Real iCloud transport, two-device restore
+and picker/confirmation interaction have not yet been tested.
 
 ## First-run setup
 

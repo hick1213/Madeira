@@ -290,6 +290,7 @@ final class MetalBackedView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         if let w = window {
+            if let scene = w.windowScene { TouchControlsHost.updateLayout(in: scene) }
             applyDisplayMode(reason: "layout")
             let full = convert(bounds, to: w)
             winios_set_compositor_frame(full.minX, full.minY, full.width, full.height)
@@ -1232,6 +1233,22 @@ struct MadeiraMetalView: UIViewRepresentable {
     func updateUIView(_ uiView: MetalBackedView, context: Context) {}
 }
 
+@MainActor private struct InstallSetupObservers: ViewModifier {
+    @ObservedObject var steamSetup: SteamOwnedLibrary
+    @ObservedObject var runtimePreflight: RuntimePreflightController
+    let scenePhase: ScenePhase
+    let processInstallSetups: () -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: steamSetup.installSetups) { _, _ in processInstallSetups() }
+            .onChange(of: steamSetup.hasActiveDownload) { _, _ in processInstallSetups() }
+            .onChange(of: steamSetup.signedIn) { _, _ in processInstallSetups() }
+            .onChange(of: scenePhase) { _, phase in if phase == .active { processInstallSetups() } }
+            .onChange(of: runtimePreflight.isPresented) { _, visible in if !visible { processInstallSetups() } }
+    }
+}
+
 struct ContentView: View {
     /// iOS 26 and later blur content under the navigation bar themselves.
     private static var systemScrollEdge: Bool {
@@ -1244,6 +1261,7 @@ struct ContentView: View {
     @State private var jitStatus: JITStatus = .unknown
     /// Play without JIT: the start that waits for Enable JIT (jitReadyForLaunch).
     @State private var launchAfterJIT: (() -> Void)?
+    @State private var launchAfterJITPreparation: UUID?
     @State private var entitlements: EntitlementStatus?
     @State private var debuggerAttached = isDebuggerAttached()
     @ObservedObject private var input = InputSettings.shared
@@ -1254,6 +1272,13 @@ struct ContentView: View {
     /// replaces both bodies below, and a running library session gets the
     /// full-screen `sessionBody`.
     @ObservedObject private var library = LibraryModel.shared
+    private let steamSetup = SteamOwnedLibrary.shared
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var installSetupTask: Task<Void, Never>?
+    @StateObject private var runtimePreflight = RuntimePreflightController(diagnostic: { LogStore.shared.log($0) })
+    @State private var runtimeInstallerEntry: UUID?
+    @State private var runtimeInstallerMonitor: Task<Void, Never>?
+    @State private var runtimeLaunchGuard: (preparation: UUID, valid: () -> Bool)?
     /// "Use New Interface" (actionButtons) applies at the next start.
     @State private var showFrontendRestart = false
 
@@ -1287,6 +1312,9 @@ struct ContentView: View {
             }
             .navigationTitle("Madeira")
             .navigationBarTitleDisplayMode(.inline)
+            .sheet(isPresented: Binding(get: { runtimePreflight.isPresented && runtimeInstallerEntry == nil }, set: { visible in
+                if !visible, runtimeInstallerEntry == nil { runtimePreflight.cancel() }
+            })) { RuntimePreflightSheet(model: runtimePreflight) }
             .toolbarBackground(.regularMaterial, for: .navigationBar)
             // The library keeps a material bar only before iOS 26. From iOS 26 the
             // system draws its soft scroll edge effect instead: content scrolls
@@ -1332,9 +1360,11 @@ struct ContentView: View {
             } message: { Text(library.cloudNotice?.message ?? "") }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                 library.refreshFlag()
+                PhoneSessionOrientation.update(session: library.current != nil)
                 if library.enabled && library.current == nil { MetalHostView.shared.isHidden = true }
             }
             .onAppear {
+                PhoneSessionOrientation.update(session: library.current != nil)
                 jit_install_trap_handler()
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
@@ -1353,6 +1383,34 @@ struct ContentView: View {
             // now or, from a cold start, once the library is up.
             .onReceive(ShortcutRouter.shared.$pendingExe) { _ in launchPendingShortcut() }
             .onChange(of: library.enabled) { _, _ in launchPendingShortcut() }
+            .onChange(of: library.current) { _, current in
+                PhoneSessionOrientation.update(session: current != nil)
+                if current == nil { finishRuntimeInstallerWhenStopped() }
+            }
+            .onChange(of: library.error) { _, _ in
+                if library.current == nil { finishRuntimeInstallerWhenStopped() }
+            }
+            .onChange(of: library.runtimeCheckEntry) { _, id in
+                guard let id else { return }
+                library.runtimeCheckEntry = nil
+                if let entry = library.entries.first(where: { $0.id == id }) {
+                    launchLibraryEntry(entry, inspectionOnly: true)
+                }
+            }
+            .modifier(InstallSetupObservers(steamSetup: steamSetup, runtimePreflight: runtimePreflight,
+                                            scenePhase: scenePhase, processInstallSetups: processInstallSetups))
+            .onChange(of: library.runtimePreflightNotice) { _, notice in
+                if notice != nil { devSheet = nil }
+            }
+            .onReceive(GameSessionWork.shared.$pausesBackgroundWork) { paused in
+                if !paused { runtimeLaunchGuard = nil }
+                if !paused { DispatchQueue.main.async { processInstallSetups() } }
+                if !paused, runtimePreflight.phase == .installing, runtimeInstallerEntry == nil,
+                   library.current == nil, wine_process_is_running() == 0, wineserver_is_running() == 0 {
+                    runtimePreflight.installationFailedToStart("启动准备已结束，请关闭此窗口后重新检查。", sessionConsumed: false)
+                    runtimePreflight.isPresented = true
+                }
+            }
         }
     }
 
@@ -2148,8 +2206,11 @@ struct ContentView: View {
         .sheet(item: $devSheet) { sheet in
             switch sheet {
             case .steamSignIn: SteamSignInView()
+            case .epicSignIn: EpicSignInView()
             case .dock: MadeiraDockView { startDock($0, compactPool: $1) }
             case .allSettings: AllSettingsView()
+            case .controllerTest: NavigationStack { ControllerTestView() }
+            case .steamDownloadSource: NavigationStack { SteamDownloadSettingsView() }
             }
         }
     }
@@ -2398,30 +2459,35 @@ struct ContentView: View {
     private func launchAfterJITEnded(started: Bool) {
         guard let launch = launchAfterJIT else { return }
         launchAfterJIT = nil
+        let preparation = launchAfterJITPreparation; launchAfterJITPreparation = nil
         library.startingJIT = nil
-        guard started, StikJITHelper.ready, library.current == nil, wine_process_is_running() == 0 else {
+        guard started, StikJITHelper.ready, library.current == nil,
+              wine_process_is_running() == 0, wineserver_is_running() == 0 else {
+            if let preparation { GameSessionWork.shared.completePreparation(preparation) }
             logStore.log("[jit-on-play] JIT did not come on: the game was not started")
             // A failure has its own error; this one closes the details page as well.
             if started, library.current == nil { library.error = "JIT is on, but the game could not start. Tap Play again." }
             return
         }
+        if let preparation, !GameSessionWork.shared.ownsPreparation(preparation) { return }
         logStore.log("[jit-on-play] JIT is on: starting the game")
         launch()
     }
 
-    /// Whether a launch may ask for the JIT pool. In the library, `then` makes Play
+    /// Whether a launch may ask for the JIT pool. `then` makes a launch
     /// enable JIT itself (the same flow as Enable JIT, LocalDevVPN and the Madeira JIT
     /// shortcut included) and start the game once the debugger is attached; that also
     /// covers CS_DEBUGGED set with no debugger attached (JIT enabled from StikDebug's
     /// own list, which attaches and leaves). Without `then`, the library offers
     /// Madeira's Enable JIT instead of starting a launch that cannot get its pool.
-    private func jitReadyForLaunch(inLibrary: Bool, entry: UUID? = nil, then launch: (() -> Void)? = nil) -> Bool {
+    private func jitReadyForLaunch(inLibrary: Bool, entry: UUID? = nil, preparation: UUID? = nil, then launch: (() -> Void)? = nil) -> Bool {
         if StikJITHelper.ready { return true }
-        if inLibrary, let launch {
+        if let launch {
             logStore.log("[jit-on-play] JIT is not on: enabling it, then starting the game")
             launchAfterJIT = launch
+            launchAfterJITPreparation = preparation
             library.startingJIT = entry
-            if jitStatus != .testing { enableJIT() }   // a second Play while it runs only replaces the game
+            if jitStatus != .testing { enableJIT() }   // share an already running JIT setup
             return false
         }
         if StikJITHelper.flaggedWithoutDebugger {
@@ -2502,7 +2568,211 @@ struct ContentView: View {
     /// Play in the library (Library.swift): checks that a session can start,
     /// applies the entry's launch profile and runs the same full sequence as the
     /// developer interface's buttons.
+    private func runtimeIdentity(_ entry: LibraryEntry) -> String {
+        if let app = entry.steamAppID { return "steam:\(SteamSignIn.accountName ?? "offline"):\(app):\(entry.id)" }
+        if let app = entry.epicAppName { return "epic:\(entry.epicAccountKey ?? ""):\(app):\(entry.id)" }
+        return "library:\(entry.externalLibraryID?.uuidString ?? "internal"):\(entry.id)"
+    }
+
+    /// A cheap, read-only guard against replacing the selected entry or its
+    /// declaration while its asynchronous check/installer download is pending.
+    private func runtimeSourceSeal(_ executable: URL, entry: LibraryEntry?) -> String {
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        let profile = entry.flatMap { try? encoder.encode($0) }?.base64EncodedString() ?? ""
+        let files = [executable, executable.deletingPathExtension().appendingPathExtension("runtimeconfig.json"),
+                     executable.appendingPathExtension("config")]
+        let stamps = files.map { file -> String in
+            var info = stat()
+            guard lstat(file.path, &info) == 0 else { return file.path + ":absent" }
+            return "\(file.path):\(info.st_dev):\(info.st_ino):\(info.st_mode):\(info.st_size):\(info.st_mtimespec.tv_sec):\(info.st_mtimespec.tv_nsec):\(info.st_ctimespec.tv_sec):\(info.st_ctimespec.tv_nsec)"
+        }
+        return ([profile] + stamps).joined(separator: "\n")
+    }
+
+    private func checkRuntime(executable: URL, gameRoot: URL, title: String, identity: String,
+                              entry: LibraryEntry?, preparation: UUID, inspectionOnly: Bool,
+                              repairAutomatically: Bool = false,
+                              validWhile: @escaping () -> Bool = { true },
+                              release: @escaping () -> Void = {}, proceed: @escaping () -> Void) {
+        let work = GameSessionWork.shared
+        let notice = UUID()
+        let originalSeal = runtimeSourceSeal(executable, entry: entry)
+        let epicKey = entry?.epicAppName == nil ? nil : EpicLibraryModel.shared.accountKey
+        let steamSource = identity.hasPrefix("steam:")
+        let steamAccount = steamSource ? SteamSignIn.accountName : nil
+        let context = RuntimePreflightController.Context(id: notice, title: title, identity: identity,
+            executable: executable, gameRoot: gameRoot, drive: LibraryModel.drive, prefix: MadeiraDock.prefix,
+            inspectionOnly: inspectionOnly, repairAutomatically: repairAutomatically)
+        library.error = nil
+        library.runtimePreflightNotice = notice
+        let identityValid: () -> Bool = {
+            if steamSource, SteamSignIn.accountName != steamAccount { return false }
+            if let entry {
+                guard let current = library.entries.first(where: { $0.id == entry.id }),
+                      runtimeSourceSeal(executable, entry: current) == originalSeal else { return false }
+                if entry.epicAppName != nil, EpicLibraryModel.shared.accountKey != epicKey { return false }
+                if entry.steamAppID != nil, SteamSignIn.accountName != steamAccount { return false }
+            } else if runtimeSourceSeal(executable, entry: nil) != originalSeal { return false }
+            return true
+        }
+        let valid: () -> Bool = {
+            validWhile() && identityValid() && work.ownsPreparation(preparation) && library.current == nil &&
+                wine_process_is_running() == 0 && wineserver_is_running() == 0 &&
+                library.runtimePreflightNotice == notice
+        }
+        let cancel: () -> Void = {
+            if library.runtimePreflightNotice == notice { library.runtimePreflightNotice = nil }
+            work.completePreparation(preparation)
+            release()
+        }
+        Task { @MainActor in
+            do {
+                try await work.waitForLaunchPreparation(preparation)
+                // Allow the existing game/details/settings sheet to dismiss.
+                try await Task.sleep(for: .milliseconds(400))
+                guard valid() else { cancel(); return }
+                runtimePreflight.begin(context: context, valid: valid, identityValid: identityValid, proceed: {
+                    guard valid() else { cancel(); return }
+                    runtimeLaunchGuard = (preparation, identityValid)
+                    library.runtimePreflightNotice = nil
+                    proceed()
+                }, cancel: cancel, install: { plan in
+                    startRuntimeRepair(plan, context: context, preparation: preparation, valid: valid)
+                })
+            } catch {
+                cancel()
+                if !(error is CancellationError) { library.error = error.localizedDescription }
+            }
+        }
+    }
+
+    /// The download's explicit setup choice owns this request. A completed game
+    /// never starts automatically, and Windows setup waits for the foreground.
+    private func processInstallSetups() {
+        guard installSetupTask == nil, !runtimePreflight.isPresented, runtimeInstallerEntry == nil,
+              !runtimePreflight.requiresRestart, !steamSetup.installSetups.requests.isEmpty else { return }
+        let entries = Dictionary(uniqueKeysWithValues: library.entries.compactMap { entry in
+            entry.steamAppID.map { (entry.id, $0) }
+        })
+        guard let request = steamSetup.takeInstallSetup(entries: entries, foreground: UIApplication.shared.applicationState == .active,
+            idle: library.enabled && library.current == nil && !GameSessionWork.shared.pausesBackgroundWork &&
+                !steamSetup.hasActiveDownload && !steamSetup.hasInFlightDownload &&
+                !EpicLibraryModel.shared.hasInFlightDownload &&
+                wine_process_is_running() == 0 && wineserver_is_running() == 0,
+            sessionAvailable: LibraryModel.sessionsThisRun == 0) else { return }
+        installSetupTask = Task { @MainActor in
+            defer { installSetupTask = nil }
+            guard steamSetup.ownsInstallSetup(request) else {
+                steamSetup.deferInstallSetup(request)
+                return
+            }
+            guard let entry = library.entries.first(where: { $0.id == request.entryID && $0.steamAppID == request.appID }),
+                  let game = MadeiraDock.games(drive: MadeiraDock.drive).first(where: { $0.id == request.appID }) else { return }
+            let folder = MadeiraDock.drive.appendingPathComponent(game.library + "/common/" + game.installDir)
+            let options = await steamSetup.launchOptions(appID: request.appID)
+            guard UIApplication.shared.applicationState == .active, steamSetup.ownsInstallSetup(request), library.current == nil,
+                  !GameSessionWork.shared.pausesBackgroundWork, LibraryModel.sessionsThisRun == 0 else {
+                steamSetup.deferInstallSetup(request)
+                return
+            }
+            let selected = entry.startsSteamGameDirectly ? entry.steamProgram : nil
+            let program = selected ?? options.flatMap { SteamDirectStart.choose($0, installFolder: folder)?.program }
+            guard let program else {
+                library.error = "游戏文件已下载。未能确定启动程序，请在游戏详情选择 Program 后检查运行环境。"
+                return
+            }
+            do {
+                let preparation = try GameSessionWork.shared.beginLaunchPreparation()
+                let setupGate = SteamInstallSetupQueue.DeferralGate()
+                LogStore.shared.log("[steam-setup] app=\(request.appID) checking-runtime=1")
+                checkRuntime(executable: folder.appendingPathComponent(program), gameRoot: folder,
+                    title: entry.title, identity: runtimeIdentity(entry), entry: entry, preparation: preparation,
+                    inspectionOnly: true, repairAutomatically: true,
+                    validWhile: { setupGate.permits(foreground: UIApplication.shared.applicationState == .active,
+                                                    ownsRequest: steamSetup.ownsInstallSetup(request)) }, release: {
+                        if setupGate.deferred && !runtimePreflight.requiresRestart {
+                            steamSetup.deferInstallSetup(request)
+                        }
+                    }, proceed: {})
+            } catch { library.error = "游戏文件已下载，运行环境准备未启动：\(error.localizedDescription)" }
+        }
+    }
+
+    private func startRuntimeRepair(_ plan: RuntimeRepair.Plan, context: RuntimePreflightController.Context,
+                                    preparation: UUID, valid: @escaping () -> Bool) {
+        guard valid() else {
+            runtimePreflight.installationFailedToStart("运行环境准备已暂缓。", sessionConsumed: false)
+            runtimePreflight.cancel()
+            return
+        }
+        let relative: String
+        do { relative = try RuntimeRepair.scriptRelativePath(plan: plan, drive: LibraryModel.drive) }
+        catch {
+            runtimePreflight.installationFailedToStart("修复路径已变化，请重新准备。", sessionConsumed: false); return
+        }
+        var installer = LibraryEntry(title: "安装运行库", relativePath: relative, bits: 64)
+        installer.launchMode = "desktop"
+        // The bound repair script owns services startup and final guest shutdown.
+        // Never create an unbound per-game services wrapper for this entry.
+        // The 64-bit command session starts a 32-bit installer bootstrapper.
+        // Its GDI table must be shared before the first Wine GUI initialization.
+        installer.config = "env.MADEIRA_GDI_SHARED_SECTION = 1\nenv.MADEIRA_MADSYNC_SESSION = 0\nenv.MADEIRA_WAIT_CHILDREN = 0\n"
+        let profile = installer
+        runtimePreflight.isPresented = false
+        let start: () -> Void = {
+            Task { @MainActor in
+                do {
+                    try await GameSessionWork.shared.waitForLaunchPreparation(preparation)
+                    let validation = Task.detached(priority: .userInitiated) {
+                        try RuntimeRepair.validate(plan: plan, identity: context.identity, drive: context.drive)
+                    }
+                    try await withTaskCancellationHandler(operation: { try await validation.value }, onCancel: { validation.cancel() })
+                    guard valid(), StikJITHelper.ready else { throw GameSessionWork.Failure.launchPreparationEnded }
+                    _ = try LibraryModel.executable(profile.launchRelativePath)
+                    try profile.validate()
+                    runtimeInstallerEntry = profile.id
+                    RuntimeInstallerPresentation.shared.model = runtimePreflight
+                    startPreparedLibraryEntry(profile, preparation: preparation, runtimeRepair: true)
+                } catch {
+                    runtimePreflight.installationFailedToStart("无法启动安装会话：\(error.localizedDescription)", sessionConsumed: false)
+                    if context.repairAutomatically && UIApplication.shared.applicationState != .active { runtimePreflight.cancel() }
+                    else { runtimePreflight.isPresented = true }
+                }
+            }
+        }
+        guard jitReadyForLaunch(inLibrary: true, entry: profile.id, preparation: preparation, then: start) else { return }
+        start()
+    }
+
+    private func finishRuntimeInstallerWhenStopped() {
+        guard runtimeInstallerEntry != nil, library.current == nil, runtimeInstallerMonitor == nil else { return }
+        runtimeInstallerMonitor = Task { @MainActor in
+            while wine_process_is_running() != 0 || wineserver_is_running() != 0 {
+                if Task.isCancelled { runtimeInstallerMonitor = nil; return }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            if LibraryModel.sessionsThisRun > 0 { await runtimePreflight.installationEnded() }
+            else { runtimePreflight.installationFailedToStart("安装会话未启动，请重新准备。", sessionConsumed: false) }
+            runtimeInstallerEntry = nil; runtimeInstallerMonitor = nil
+            RuntimeInstallerPresentation.shared.model = nil
+            runtimePreflight.isPresented = true
+        }
+    }
+
     private func launchLibraryEntry(_ entry: LibraryEntry) {
+        launchLibraryEntry(entry, inspectionOnly: false)
+    }
+
+    private func launchLibraryEntry(_ entry: LibraryEntry, inspectionOnly: Bool) {
+        if entry.externalLibraryID != nil, entry.steamAppID != nil || entry.epicAppName != nil || entry.epicAccountKey != nil || entry.desktop == true {
+            library.error = "An external game cannot also be a Steam, Epic or Desktop entry."; return
+        }
+        guard !GameSessionWork.shared.isSynchronizingSaves else {
+            library.error = GameSessionWork.Failure.savesSyncing.localizedDescription; return
+        }
+        if entry.epicAppName == nil, wine_process_is_running() == 0, library.current == nil {
+            wine_epic_clear_launch(); EpicLaunchLogPrivacy.shared.set(nil)
+        }
         // A Steam game starts through Madeira Dock with its own launch profile (SteamGames.swift),
         // unless its Game details page chose "The game": then its own program starts below, like
         // any library game (SteamDirectStart).
@@ -2511,11 +2781,13 @@ struct ContentView: View {
                 library.error = "Steam no longer lists this game as installed. Refresh the library and try again."; return
             }
             LogStore.shared.log("[steam-games] play app=\(appID)")
-            startDock(game, compactPool: MadeiraDockModel.shared.compactPool, profile: entry)
+            startDock(game, compactPool: MadeiraDockModel.shared.compactPool, profile: entry, inspectionOnly: inspectionOnly)
             return
         }
         if let appID = entry.steamAppID {
-            guard cloudClear(appID, name: entry.title, retry: { launchLibraryEntry(entry) }) else { return }
+            if !inspectionOnly {
+                guard cloudClear(appID, name: entry.title, retry: { launchLibraryEntry(entry, inspectionOnly: inspectionOnly) }) else { return }
+            }
             guard entry.steamProgram?.isEmpty == false else {
                 library.error = "Choose the program to start in Game details › Steam › Program."; return
             }
@@ -2533,22 +2805,127 @@ struct ContentView: View {
         // The same precondition runWineFullSequence checks: the JIT pool is
         // taken at launch, through the debugger. Without it, Play enables JIT and
         // continues from here once it is on.
-        guard jitReadyForLaunch(inLibrary: true, entry: entry.id, then: { startLibraryEntry(entry) }) else { return }
-        startLibraryEntry(entry)
+        let preparation: UUID
+        do { preparation = try GameSessionWork.shared.beginLaunchPreparation() }
+        catch { library.error = error.localizedDescription; return }
+        let externalContext: ExternalGameLaunchContext?
+        do {
+            externalContext = try entry.externalLibraryID.map { try ExternalGameLibrary.shared.prepare($0, relative: entry.relativePath) }
+        } catch {
+            GameSessionWork.shared.completePreparation(preparation)
+            library.error = error.localizedDescription; return
+        }
+        if entry.desktop == true {
+            continueLibraryLaunch(entry, preparation: preparation, externalContext: externalContext)
+            return
+        }
+        do {
+            let executable = try externalContext?.validate() ?? LibraryModel.executable(entry.launchRelativePath)
+            let root = externalContext?.lease.root ?? executable.deletingLastPathComponent()
+            checkRuntime(executable: executable, gameRoot: root, title: entry.title,
+                         identity: runtimeIdentity(entry), entry: entry, preparation: preparation,
+                         inspectionOnly: inspectionOnly,
+                         release: { externalContext?.finish(started: false) }) {
+                continueLibraryLaunch(entry, preparation: preparation, externalContext: externalContext)
+            }
+        } catch {
+            externalContext?.finish(started: false)
+            GameSessionWork.shared.completePreparation(preparation)
+            library.error = error.localizedDescription
+        }
+    }
+
+    private func continueLibraryLaunch(_ entry: LibraryEntry, preparation: UUID,
+                                       externalContext: ExternalGameLaunchContext?) {
+        guard GameSessionWork.shared.ownsPreparation(preparation) else { externalContext?.finish(started: false); return }
+        guard jitReadyForLaunch(inLibrary: true, entry: entry.id, preparation: preparation,
+                                then: { startLibraryEntry(entry, preparation: preparation, externalContext: externalContext) }) else { return }
+        startLibraryEntry(entry, preparation: preparation, externalContext: externalContext)
+    }
+
+    private func runtimeLaunchStillValid(_ preparation: UUID) -> Bool {
+        guard let checked = runtimeLaunchGuard, checked.preparation == preparation else { return true }
+        guard checked.valid() else {
+            runtimeLaunchGuard = nil
+            GameSessionWork.shared.completePreparation(preparation)
+            library.error = "游戏入口或账户在检查后发生变化，请重新启动。"
+            return false
+        }
+        return true
     }
 
     /// The rest of Play, with JIT on: checks the entry's launch profile and starts it.
-    private func startLibraryEntry(_ entry: LibraryEntry) {
-        do { if entry.desktop != true { _ = try LibraryModel.executable(entry.launchRelativePath) }; try entry.validate() }
+    private func startLibraryEntry(_ entry: LibraryEntry, preparation: UUID, externalContext: ExternalGameLaunchContext? = nil) {
+        guard GameSessionWork.shared.ownsPreparation(preparation) else { externalContext?.finish(started: false); return }
+        guard runtimeLaunchStillValid(preparation) else { externalContext?.finish(started: false); return }
+        if entry.epicAppName != nil {
+            Task { @MainActor in
+                var prepared: EpicPreparedLaunch?
+                do {
+                    _ = try LibraryModel.executable(entry.launchRelativePath)
+                    try entry.validate()
+                    guard entry.launchWindowsPath.utf8.count < 1024, entry.launchArguments.utf8.count < 4096 else {
+                        throw EpicLaunchArguments.Invalid(reason: "The Epic executable path or arguments are too long.")
+                    }
+                    let launch = try await EpicLibraryModel.shared.launch(entry)
+                    prepared = launch
+                    guard runtimeLaunchStillValid(preparation) else { launch.cancelBeforeStart(); return }
+                    guard GameSessionWork.shared.ownsPreparation(preparation), wine_process_is_running() == 0,
+                          wineserver_is_running() == 0, library.current == nil else {
+                        launch.cancelBeforeStart()
+                        GameSessionWork.shared.completePreparation(preparation); return
+                    }
+                    let data = try JSONEncoder().encode(launch.arguments)
+                    guard let json = String(data: data, encoding: .utf8),
+                          wine_epic_prepare_launch(json, launch.secret, entry.runsInDesktop ? "explorer.exe" : entry.launchWindowsPath) == 0 else {
+                        throw EpicLaunchArguments.Invalid(reason: "Could not prepare Epic's authenticated launch.")
+                    }
+                    EpicLaunchLogPrivacy.shared.set(launch.secret)
+                    startPreparedLibraryEntry(entry, preparation: preparation, epicLaunch: launch)
+                } catch {
+                    prepared?.cancelBeforeStart()
+                    GameSessionWork.shared.completePreparation(preparation)
+                    library.error = EpicLibraryModel.message(error)
+                }
+            }
+            return
+        }
+        startPreparedLibraryEntry(entry, preparation: preparation, externalContext: externalContext)
+    }
+
+    private func startPreparedLibraryEntry(_ entry: LibraryEntry, preparation: UUID, externalContext: ExternalGameLaunchContext? = nil,
+                                           epicLaunch: EpicPreparedLaunch? = nil, runtimeRepair: Bool = false) {
+        guard GameSessionWork.shared.ownsPreparation(preparation) else { externalContext?.finish(started: false); epicLaunch?.cancelBeforeStart(); return }
+        guard runtimeLaunchStillValid(preparation) else {
+            externalContext?.finish(started: false); epicLaunch?.cancelBeforeStart()
+            if epicLaunch != nil { wine_epic_clear_launch(); EpicLaunchLogPrivacy.shared.set(nil) }
+            return
+        }
+        do {
+            if let externalContext {
+                guard entry.externalLibraryID == externalContext.rootID else { throw ExternalGameLibrary.Failure.path }
+                _ = try externalContext.validate()
+                try externalContext.validateWorkingDirectory(entry.workingDirectory)
+            } else if entry.desktop != true { _ = try LibraryModel.executable(entry.launchRelativePath) }
+            try entry.validate()
+        }
         catch {
+            externalContext?.finish(started: false)
+            epicLaunch?.cancelBeforeStart()
+            if entry.epicAppName != nil { wine_epic_clear_launch(); EpicLaunchLogPrivacy.shared.set(nil) }
             library.error = error.localizedDescription
+            GameSessionWork.shared.completePreparation(preparation)
             logStore.log("[launch-preflight] profile validation failed: \(error.localizedDescription)", level: .error)
             return
         }
         // launchArguments carries the whole ml1163 command (explorer's /desktop=, the quoted
         // program, its arguments); validate() and the bridge's tokenizer take 4 KB.
         guard entry.launchWindowsPath.utf8.count < 1024, entry.launchArguments.utf8.count < 4096 else {
-            library.error = "The executable path or launch arguments are too long."; return
+            externalContext?.finish(started: false)
+            epicLaunch?.cancelBeforeStart()
+            if entry.epicAppName != nil { wine_epic_clear_launch(); EpicLaunchLogPrivacy.shared.set(nil) }
+            library.error = "The executable path or launch arguments are too long."
+            GameSessionWork.shared.completePreparation(preparation); return
         }
         entry.configureLaunch()
         // This run's log under the program's name too (Documents/logs). A Steam game started
@@ -2556,23 +2933,65 @@ struct ContentView: View {
         let program = entry.desktop == true ? "explorer.exe"
             : entry.launchWindowsPath.split(separator: "\\").last.map(String.init) ?? entry.launchWindowsPath
         LogStore.shared.startSessionLog(program: program)
-        library.begin(entry)
-        runWineFullSequence(profile: entry)
+        if runtimeRepair { runtimePreflight.installerStarted() }
+        library.begin(entry, remember: !runtimeRepair)
+        runtimeLaunchGuard = nil
+        runWineFullSequence(profile: entry, preparation: preparation, externalContext: externalContext, epicLaunch: epicLaunch)
+    }
+
+    /// Reenter the normal launch only after canceled background file work ends.
+    private func backgroundReadyForLaunch(preparation: UUID, onFailure: @escaping (Error) -> Void,
+                                          then launch: @escaping () -> Void) -> Bool {
+        let work = GameSessionWork.shared
+        guard work.ownsPreparation(preparation) else { return false }
+        if work.backgroundWorkIsDrained { return true }
+        Task { @MainActor in
+            do { try await work.waitForLaunchPreparation(preparation); launch() }
+            catch { onFailure(error) }
+        }
+        return false
     }
 
     /// Full sequence: allocate JIT pool, start wineserver, start Wine.
     /// Debugger stays attached during PE loading so mprotect_exec can use BRK
     /// to prepare code pages. Detach happens after Wine finishes + recovery.
     /// `profile` is a library entry whose launch profile applies to this run.
-    private func runWineFullSequence(profile: LibraryEntry? = nil) {
-        guard jit_check_debugged() else {
-            logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
-            if profile != nil { LibraryModel.shared.launchFailed() }
+    private func runWineFullSequence(profile: LibraryEntry? = nil, preparation suppliedPreparation: UUID? = nil,
+                                     externalContext: ExternalGameLaunchContext? = nil, epicLaunch: EpicPreparedLaunch? = nil) {
+        if let suppliedPreparation, !GameSessionWork.shared.ownsPreparation(suppliedPreparation) { externalContext?.finish(started: false); epicLaunch?.cancelBeforeStart(); return }
+        guard !GameSessionWork.shared.isSynchronizingSaves else {
+            let message = GameSessionWork.Failure.savesSyncing.localizedDescription
+            externalContext?.finish(started: false)
+            epicLaunch?.cancelBeforeStart()
+            logStore.log(message, level: .error); library.error = message; return
+        }
+        guard wine_process_is_running() == 0, wineserver_is_running() == 0 else {
+            externalContext?.finish(started: false)
+            epicLaunch?.cancelBeforeStart()
+            logStore.log("A session is already running.", level: .error)
+            if profile != nil { LibraryModel.shared.launchFailed("A session is already running.") }
+            if let suppliedPreparation { GameSessionWork.shared.completePreparation(suppliedPreparation) }
             return
         }
+        let preparation: UUID
+        do { preparation = try suppliedPreparation ?? GameSessionWork.shared.beginLaunchPreparation() }
+        catch { logStore.log(error.localizedDescription, level: .error); library.error = error.localizedDescription; return }
+        if profile?.epicAppName == nil { wine_epic_clear_launch(); EpicLaunchLogPrivacy.shared.set(nil) }
+        guard jitReadyForLaunch(inLibrary: library.enabled, entry: profile?.id, preparation: preparation,
+                                then: { runWineFullSequence(profile: profile, preparation: preparation, externalContext: externalContext, epicLaunch: epicLaunch) }) else { return }
+        guard backgroundReadyForLaunch(preparation: preparation, onFailure: { error in
+            externalContext?.finish(started: false)
+            epicLaunch?.cancelBeforeStart()
+            guard GameSessionWork.shared.ownsPreparation(preparation) else { return }
+            logStore.log(error.localizedDescription, level: .error)
+            library.launchFailed(error.localizedDescription)
+            GameSessionWork.shared.completePreparation(preparation)
+        }, then: {
+            runWineFullSequence(profile: profile, preparation: preparation, externalContext: externalContext, epicLaunch: epicLaunch)
+        }) else { return }
         // Steam downloads wait for the session, and the app's own Steam connection closes
         // before Valve's client signs in with the same account (SteamOwnedLibrary).
-        SteamOwnedLibrary.shared.sessionChanged(active: true)
+        GameSessionWork.shared.reconcile()
         /* ml1095: one config file. Written once from any legacy madeira-*.txt. */
         MadeiraConfig.migrateLegacy { self.logStore.log($0) }
         MadeiraConfig.deleteLegacyFiles { self.logStore.log($0) }   /* ml1096: the old files go once the cfg exists */
@@ -2606,6 +3025,10 @@ struct ContentView: View {
         ws_log_quiet = 1
 
         DispatchQueue.global(qos: .userInitiated).async {
+            // Every early worker return releases an unsuccessful external launch.
+            // finish(true) below makes this deferred cleanup harmless after start.
+            defer { externalContext?.finish(started: false) }
+            defer { epicLaunch?.cancelBeforeStart() }
             // A library entry's launch profile (executable, arguments, x87
             // precision, frame limit).
             if let profile {
@@ -3089,8 +3512,12 @@ struct ContentView: View {
                 logStore.log("  " + (reason ?? "No reason was recorded; see the pool lines above."), level: .info)
                 logStore.uiPaused = false
                 // A library session that never started returns to the library.
+                wine_epic_clear_launch(); EpicLaunchLogPrivacy.shared.set(nil)
                 let offerJIT = reason == StikJITHelper.noDebuggerMessage
-                DispatchQueue.main.async { LibraryModel.shared.launchFailed(reason, offerJIT: offerJIT) }
+                DispatchQueue.main.async {
+                    LibraryModel.shared.launchFailed(reason, offerJIT: offerJIT)
+                    GameSessionWork.shared.completePreparation(preparation)
+                }
                 return
             }
 
@@ -3159,7 +3586,45 @@ struct ContentView: View {
                 Thread.sleep(forTimeInterval: 2.0)
             }
             winios_phase("wine-start")
-            self.startWineProcess()
+            if let externalContext {
+                do { _ = try externalContext.validate(); try externalContext.validateWorkingDirectory(profile?.workingDirectory) }
+                catch {
+                    let reason = error.localizedDescription
+                    // The server belongs to this preparation; no Wine client
+                    // has started, so a failed path recheck must also stop it.
+                    wineserver_stop()
+                    DispatchQueue.main.async {
+                        heartbeat.invalidate(); ws_log_quiet = 0; logStore.uiPaused = false
+                        LibraryModel.shared.launchFailed(reason)
+                        GameSessionWork.shared.completePreparation(preparation)
+                    }
+                    return
+                }
+            }
+            do { try epicLaunch?.claimForRuntime() }
+            catch {
+                // This preparation started the server, but has not started a
+                // Wine client. Revoke that owned idle server before returning.
+                wineserver_stop()
+                DispatchQueue.main.async {
+                    heartbeat.invalidate(); ws_log_quiet = 0; logStore.uiPaused = false
+                    LibraryModel.shared.launchFailed(EpicLibraryModel.message(error))
+                    GameSessionWork.shared.completePreparation(preparation)
+                }
+                return
+            }
+            let wineStarted = self.startWineProcess()
+            externalContext?.finish(started: wineStarted)
+            if !wineStarted {
+                wineserver_stop()
+                epicLaunch?.finish()
+                DispatchQueue.main.async {
+                    heartbeat.invalidate(); ws_log_quiet = 0; logStore.uiPaused = false
+                    LibraryModel.shared.launchFailed("Wine could not start. See the launch log.")
+                    GameSessionWork.shared.completePreparation(preparation)
+                }
+                return
+            }
 
             // Step 4: Wait for Wine to finish instead of fixed timer
             // Poll wine_process_is_running() — it clears when __wine_main returns
@@ -3243,6 +3708,7 @@ struct ContentView: View {
             DispatchQueue.main.async {
                 heartbeat.invalidate()
                 if wine_process_is_running() == 0 { LibraryModel.shared.launchFailed() }
+                GameSessionWork.shared.completePreparation(preparation)
             }
         }
     }
@@ -3255,23 +3721,68 @@ struct ContentView: View {
     /// show in the library, and the session gets the full-screen game view.
     /// `profile` is a Steam game's library entry (its Game details page): the
     /// session then takes that entry's display, performance and on-screen settings.
-    private func startDock(_ game: DockGame, compactPool: Bool, profile: LibraryEntry? = nil) {
+    private func startDock(_ game: DockGame, compactPool: Bool, profile: LibraryEntry? = nil,
+                           preparation suppliedPreparation: UUID? = nil, launchOption resolvedOption: UInt32? = nil,
+                           runtimeExecutable: URL? = nil, runtimeChecked: Bool = false, inspectionOnly: Bool = false) {
         let inLibrary = library.enabled
-        guard jitReadyForLaunch(inLibrary: inLibrary, entry: profile?.id,
-                                then: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
-        guard cloudClear(game.id, name: game.name, retry: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
+        if let suppliedPreparation, !GameSessionWork.shared.ownsPreparation(suppliedPreparation) { return }
+        guard !GameSessionWork.shared.isSynchronizingSaves else {
+            let message = GameSessionWork.Failure.savesSyncing.localizedDescription
+            logStore.log(message, level: .error); library.error = message; return
+        }
         guard wine_process_is_running() == 0, wineserver_is_running() == 0, !inLibrary || library.current == nil else {
             logStore.log("[madeira-dock] a session already ran in this app run; restart Madeira first", level: .error)
             if inLibrary { library.error = "A session is already running." }
+            if let suppliedPreparation { GameSessionWork.shared.completePreparation(suppliedPreparation) }
             return
         }
         if inLibrary, LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN") {
             LogStore.shared.log("[session-once] Dock launch held: \(LibraryModel.sessionsThisRun) session(s) already ran in this app run")
             library.restartNotice = LibraryModel.restartMessage
+            if let suppliedPreparation { GameSessionWork.shared.completePreparation(suppliedPreparation) }
             return
         }
+        // This is required launch work. Resolve it while Steam's connection is
+        // still open, before preparation pauses that connection for the game.
+        guard let launchOption = resolvedOption else {
+            Task { @MainActor in
+                let options = await SteamOwnedLibrary.shared.launchOptions(appID: game.id)
+                let folder = MadeiraDock.drive.appendingPathComponent(game.library + "/common/" + game.installDir)
+                let choice = options.flatMap { SteamDirectStart.choose($0, installFolder: folder) }
+                let chosen = choice?.launchIndex
+                LogStore.shared.log("[madeira-dock] launch option \(chosen ?? 0)\(chosen == nil ? " (none chosen: the default)" : "")")
+                startDock(game, compactPool: compactPool, profile: profile, launchOption: chosen ?? 0,
+                          runtimeExecutable: choice.map { folder.appendingPathComponent($0.program) }, inspectionOnly: inspectionOnly)
+            }
+            return
+        }
+        // Resolve options before consuming a one-use Cloud decision. Runtime
+        // and JIT continuations already own this launch's preparation token.
+        if !inspectionOnly, suppliedPreparation == nil {
+            guard cloudClear(game.id, name: game.name, retry: { startDock(game, compactPool: compactPool, profile: profile, inspectionOnly: inspectionOnly) }) else { return }
+        }
+        let preparation: UUID
+        do { preparation = try suppliedPreparation ?? GameSessionWork.shared.beginLaunchPreparation() }
+        catch { logStore.log(error.localizedDescription, level: .error); library.error = error.localizedDescription; return }
+        if !runtimeChecked {
+            let folder = MadeiraDock.drive.appendingPathComponent(game.library + "/common/" + game.installDir)
+            checkRuntime(executable: runtimeExecutable ?? folder, gameRoot: folder, title: game.name,
+                         identity: profile.map(runtimeIdentity) ?? "steam:\(SteamSignIn.accountName ?? "offline"):\(game.id)",
+                         entry: profile, preparation: preparation, inspectionOnly: inspectionOnly) {
+                startDock(game, compactPool: compactPool, profile: profile, preparation: preparation,
+                          launchOption: launchOption, runtimeExecutable: runtimeExecutable, runtimeChecked: true)
+            }
+            return
+        }
+        guard runtimeLaunchStillValid(preparation) else { return }
+        guard jitReadyForLaunch(inLibrary: inLibrary, entry: profile?.id, preparation: preparation,
+                                then: { startDock(game, compactPool: compactPool, profile: profile,
+                                                  preparation: preparation, launchOption: launchOption,
+                                                  runtimeExecutable: runtimeExecutable, runtimeChecked: true) }) else { return }
         func fail(_ error: Error) {
+            guard GameSessionWork.shared.ownsPreparation(preparation) else { return }
             MadeiraDock.cleanup()
+            GameSessionWork.shared.completePreparation(preparation)
             SteamOwnedLibrary.shared.dockEnded()
             MadeiraDockModel.shared.status = error.localizedDescription
             logStore.log("[madeira-dock] not started: \(error.localizedDescription)", level: .error)
@@ -3287,20 +3798,18 @@ struct ContentView: View {
         // is handed to Valve's client, and it stays off until the Dock session has ended
         // (SteamOwnedLibrary.prepareDock / dockEnded, SteamConnectionGate).
         Task { @MainActor in
-            // Resolve the original config.launch key before closing the native connection.
-            // A filtered launch array can start at 1 (or have gaps); its offset is not the key.
-            // Without a choice (no configuration to be had, or no entry whose .exe is on disk:
-            // a launcher started through a .bat, say) it is key 0, which every Dock start
-            // used before; Dock stops at once if Steam names that entry missing.
-            let options = await SteamOwnedLibrary.shared.launchOptions(appID: game.id)
-            let installFolder = MadeiraDock.drive.appendingPathComponent(game.library + "/common/" + game.installDir)
-            let chosen = options.flatMap { SteamDirectStart.choose($0, installFolder: installFolder)?.launchIndex }
-            let launchOption = chosen ?? 0
-            LogStore.shared.log("[madeira-dock] launch option \(launchOption)\(chosen == nil ? " (none chosen: the default)" : "")")
+            guard runtimeLaunchStillValid(preparation) else { return }
             await SteamOwnedLibrary.shared.prepareDock()
             do {
+                try await GameSessionWork.shared.waitForLaunchPreparation(preparation)
+                guard runtimeLaunchStillValid(preparation) else {
+                    MadeiraDock.cleanup()
+                    SteamOwnedLibrary.shared.dockEnded()
+                    return
+                }
                 // The launch state may have changed while the connection closed.
-                guard StikJITHelper.ready, wine_process_is_running() == 0, wineserver_is_running() == 0,
+                guard GameSessionWork.shared.ownsPreparation(preparation), StikJITHelper.ready,
+                      wine_process_is_running() == 0, wineserver_is_running() == 0,
                       !inLibrary || library.current == nil else {
                     throw DockError.message("The launch state changed. Enable JIT and try again.")
                 }
@@ -3360,7 +3869,8 @@ struct ContentView: View {
                 if let profile { library.begin(profile, dock: game) }
                 else { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false, dock: game) }
             }
-            runWineFullSequence(profile: profile)
+            runtimeLaunchGuard = nil
+            runWineFullSequence(profile: profile, preparation: preparation)
         }
     }
 
@@ -3474,12 +3984,12 @@ struct ContentView: View {
         }
     }
 
-    private func startWineProcess() {
+    @discardableResult private func startWineProcess() -> Bool {
         logStore.log("Starting Wine process...")
 
         if wineserver_is_running() == 0 {
             logStore.log("Wineserver not running! Start it first.", level: .error)
-            return
+            return false
         }
 
         let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -3492,6 +4002,7 @@ struct ContentView: View {
         } else {
             logStore.log("Failed to start Wine process (error: \(result))", level: .error)
         }
+        return result == 0
     }
 
     private func testDualMapping() {
@@ -3880,8 +4391,50 @@ final class TouchControlsModel: ObservableObject {
 /// only ever draws. This one has to take input, so it discriminates: a hit that
 /// lands on the hosting root view means empty space, and empty space belongs to
 /// the game underneath — mouse-look must keep working between the buttons.
+@MainActor final class RuntimeInstallerPresentation: ObservableObject {
+    static let shared = RuntimeInstallerPresentation()
+    @Published var model: RuntimePreflightController?
+
+    static func reopenRect(in bounds: CGRect, topInset: CGFloat) -> CGRect {
+        CGRect(x: max(12, bounds.maxX - 172), y: topInset + 12,
+               width: min(160, max(0, bounds.width - 24)), height: 44)
+    }
+}
+
+/// Hosted in the controls window, above both the raw Metal view and session HUD.
+private struct RuntimeInstallerProgressOverlay: View {
+    @ObservedObject var model: RuntimePreflightController
+
+    var body: some View {
+        GeometryReader { geo in
+            if model.isPresented {
+                RuntimePreflightSheet(model: model)
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .background(Color(uiColor: .systemBackground))
+            } else {
+                let rect = RuntimeInstallerPresentation.reopenRect(
+                    in: CGRect(origin: .zero, size: geo.size), topInset: TouchControlsHost.topInset)
+                Button { model.isPresented = true } label: {
+                    Label("修复进度", systemImage: "list.bullet.clipboard")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .frame(width: rect.width, height: rect.height)
+                .position(x: rect.midX, y: rect.midY)
+            }
+        }
+    }
+}
+
 final class ControlsWindow: UIWindow {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        // Repair owns this upper window while active. Native progress takes all
+        // input; Windows view takes only its reopen button, bypassing the generic
+        // starting HUD and controls so quiet installers cannot cover progress.
+        if let repair = RuntimeInstallerPresentation.shared.model {
+            guard repair.isPresented || RuntimeInstallerPresentation.reopenRect(in: bounds, topInset: TouchControlsHost.topInset).contains(point) else { return nil }
+            return super.hitTest(point, with: event)
+        }
         let m = TouchControlsModel.shared
         // Edit mode owns the whole screen: drags and the scale pinch must not
         // leak through and swing the camera while you are arranging buttons.
@@ -3914,6 +4467,10 @@ final class ControlsWindow: UIWindow {
 enum TouchControlsHost {
     private static var window: ControlsWindow?
 
+    static var topInset: CGFloat {
+        max(window?.safeAreaInsets.top ?? 0, window?.windowScene?.statusBarManager?.statusBarFrame.height ?? 0)
+    }
+
     static func attach() {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         guard let scene = scenes.first(where: { $0.activationState == .foregroundActive })
@@ -3934,15 +4491,26 @@ enum TouchControlsHost {
             w.rootViewController = host
             window = w
         }
-        window?.frame = scene.coordinateSpace.bounds
+        updateLayout(in: scene)
         fputs("[controls] ml644 overlay attached frame=\(window?.frame ?? .zero) " +
               "controls=\(TouchControlsModel.shared.controls.count)\n", stderr)
+    }
+
+    /// A scene geometry request can rotate the interface while the device stays
+    /// upright. Follow the game view's actual layout, without a device notification.
+    static func updateLayout(in scene: UIWindowScene) {
+        guard let window, window.windowScene === scene else { return }
+        let frame = scene.coordinateSpace.bounds
+        guard window.frame != frame else { return }
+        window.frame = frame
+        fputs("[controls] overlay layout frame=\(frame)\n", stderr)
     }
 }
 
 struct TouchControlsOverlay: View {
     @ObservedObject private var m = TouchControlsModel.shared
     @ObservedObject private var library = LibraryModel.shared
+    @ObservedObject private var repair = RuntimeInstallerPresentation.shared
     @State private var pinchBase: Double?
 
     var body: some View {
@@ -3954,7 +4522,9 @@ struct TouchControlsOverlay: View {
             let session = library.current != nil
             let landscape = geo.size.width > geo.size.height || session
             ZStack(alignment: .top) {
-                if landscape {
+                if let model = repair.model {
+                    RuntimeInstallerProgressOverlay(model: model)
+                } else if landscape {
                     if (m.visible || m.editing) && !library.blocksGameplayTouch {
                         controls(geo.size, session: session)
                     }
@@ -3966,13 +4536,14 @@ struct TouchControlsOverlay: View {
             }
             .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
             .contentShape(Rectangle())
-            .gesture(scalePinch, including: m.editing ? .all : .subviews)
+            .gesture(scalePinch, including: repair.model != nil ? .subviews : m.editing ? .all : .subviews)
             .onAppear { applyDefaultLayout(geo); configureGamepad(landscape: landscape) }
             .onChange(of: geo.size) { _, _ in applyDefaultLayout(geo); configureGamepad(landscape: landscape) }
             .onChange(of: m.controls) { _, _ in configureGamepad(landscape: landscape) }
             .onChange(of: m.visible) { _, _ in configureGamepad(landscape: landscape) }
             .onChange(of: m.editing) { _, _ in configureGamepad(landscape: landscape) }
             .onChange(of: library.blocksGameplayTouch) { _, _ in configureGamepad(landscape: landscape) }
+            .onChange(of: repair.model != nil) { _, _ in configureGamepad(landscape: landscape) }
             .onDisappear { GamepadInput.shared.configureTouch(controls: []); TouchMouseGate.padOverlay = false }
         }
         .ignoresSafeArea()
@@ -4005,7 +4576,7 @@ struct TouchControlsOverlay: View {
             ? m.controls.filter { $0.action.padName.map(TouchPadAction.supported) ?? false }.map(\.id) : []
         // Menus and the control editor keep the pad connected but take no input (#204);
         // a touch that misses the controls is no mouse only while they do (#150).
-        let accepting = !m.editing && !library.blocksGameplayTouch
+        let accepting = repair.model == nil && !m.editing && !library.blocksGameplayTouch
         GamepadInput.shared.configureTouch(controls: Set(ids), acceptingInput: accepting)
         TouchMouseGate.padOverlay = accepting && !ids.isEmpty
     }

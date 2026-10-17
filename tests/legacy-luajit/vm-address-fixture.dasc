@@ -1,0 +1,143 @@
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <string.h>
+uintptr_t lj_compat_arena_base;
+#define DASM_CHECKS
+#define DASM_EXTERN(Dst,addr,idx,type) ((int)((char *)&lj_compat_arena_base-(char *)(addr)-4))
+#include "dasm_proto.h"
+#include "dasm_x86.h"
+struct item { uint64_t value; };
+struct fake_lua_state { void *base; void *top; };
+|.arch x64
+|.section code
+|.actionlist actions
+|.type ITEM, struct item
+|.type L, struct fake_lua_state
+static void generate(dasm_State **Dst) {
+|.if BIAS
+|.arena managed
+|.arena_scratch r9d, 8
+|.endif
+|.if WINFIXTURE
+| push rsi
+| mov r9d, ecx // Zero-extended global-state offset supplied by caller.
+|.else
+| mov r9d, edi
+|.endif
+| mov eax, 65536
+| mov ecx, 2
+| cmp ecx, 2
+| mov rdx, ITEM:eax->value
+| jne >1
+| movsd xmm0, qword [eax+ecx*8]
+| addsd xmm0, qword [eax+ecx*8]
+| movsd qword [eax+24], xmm0
+| add qword [eax], 3
+| mov esi, -1
+| mov ecx, [eax+esi*8+8]
+| cmp ecx, 44
+| jne >1
+| mov64 rax, UINT64_C(0x200010000)
+| mov r8, rsp
+for (int i=0; i<16; i++) {
+| mov qword [rsp+i*8-128], 0x12340000+i
+}
+#ifdef WINFIXTURE
+for (int i=0; i<4; i++) {
+| mov qword [rsp+i*8+16], 0x56780000+i
+}
+#endif
+| cmp eax, 65536
+| mov esi, 65568
+|=>0:
+| mov nativeptr L:esi->base, eax
+| mov nativeptr L:esi->top, eax
+|=>1:
+| jne >1
+| mov rcx, rax
+| seto r9b
+| lahf
+| movzx eax, ah
+| cmp eax, 0x46 // SF/ZF/AF/PF/CF from the equal comparison.
+| jne >1
+| cmp r9b, 0 // OF is not included in LAHF.
+| jne >1
+| mov64 rax, UINT64_C(0x200010000)
+| cmp rax, rcx // The source qword saved immediately after the stores.
+| jne >1
+| cmp rsp, r8
+| jne >1
+for (int i=0; i<16; i++) {
+| cmp qword [rsp+i*8-128], 0x12340000+i
+| jne >1
+}
+#ifdef WINFIXTURE
+for (int i=0; i<4; i++) {
+| cmp qword [rsp+i*8+16], 0x56780000+i
+| jne >1
+| cmp qword [rsp+i*8+48], i+5
+| jne >1
+}
+#else
+for (int i=0; i<4; i++) {
+| cmp qword [rsp+i*8+8], i+7
+| jne >1
+}
+#endif
+| sub rsp, 16
+| mov qword [rsp], rdx
+| mov rax, [rsp]
+| add rsp, 16
+|.if WINFIXTURE
+| pop rsi
+|.endif
+| ret
+|1:
+| mov eax, -1
+|.if WINFIXTURE
+| pop rsi
+|.endif
+| ret
+}
+int main(int argc, char **argv) {
+ dasm_State *d = NULL; size_t sz;
+ void *arena = mmap((void *)0x200000000ULL, 131072, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
+ if (arena == MAP_FAILED || (uintptr_t)arena != 0x200000000ULL) return 2;
+ lj_compat_arena_base = (uintptr_t)arena;
+ *(uint64_t *)((char *)arena+65536) = 41;
+ *(double *)((char *)arena+65552) = 1.25;
+ for (int state=0;state<2;state++) {
+  uint64_t *g=(uint64_t *)((char *)arena+65600+state*32);
+  g[0]=UINT64_C(0x123456789abcdef0);g[1]=UINT64_C(0xfeedfacecafebeef);g[2]=UINT64_C(0x0fedcba987654321);
+ }
+ dasm_init(&d,1); dasm_growpc(&d,2); dasm_setupglobal(&d,NULL,0); dasm_setup(&d,actions); generate(&d);
+ if (dasm_link(&d,&sz)) return 3;
+ uintptr_t hint = ((uintptr_t)&lj_compat_arena_base + 0x100000 + 4095)&~(uintptr_t)4095;
+ void *code = mmap((void *)hint,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
+ if (code == MAP_FAILED || llabs((char *)code-(char *)&lj_compat_arena_base)>0x7fffffff || dasm_encode(&d,code)) return 4;
+ if (argc==2) {
+  int start=dasm_getpclabel(&d,0),end=dasm_getpclabel(&d,1);
+  FILE *out=fopen(argv[1],"wb");
+  if (!out || start<0 || end<=start || fwrite((char *)code+start,1,(size_t)(end-start),out)!=(size_t)(end-start) || fclose(out)) return 11;
+ }
+ if (mprotect(code,4096,PROT_READ|PROT_EXEC)) return 5;
+#ifdef WINFIXTURE
+ typedef uint64_t (__attribute__((ms_abi)) *Fixture)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+#else
+ typedef uint64_t (*Fixture)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+#endif
+ uint64_t result = ((Fixture)code)(65600,2,3,4,5,6,7,8,9,10);
+ if (*(uintptr_t *)((char *)arena+65608)!=(uintptr_t)arena+65576 || *(uint64_t *)((char *)arena+65640)!=UINT64_C(0xfeedfacecafebeef)) return 8;
+ *(uint64_t *)((char *)arena+65536)=41;
+ if (((Fixture)code)(65632,2,3,4,5,6,7,8,9,10)!=41) return 9;
+ for (int state=0;state<2;state++) {
+  uint64_t *g=(uint64_t *)((char *)arena+65600+state*32);
+  if (g[0]!=UINT64_C(0x123456789abcdef0) || g[1]!=(uintptr_t)arena+65576 || g[2]!=UINT64_C(0x0fedcba987654321)) return 10;
+ }
+ if (result != 41 || *(uint64_t *)((char *)arena+65536)!=44 || *(double *)((char *)arena+65560)!=2.5) return 6;
+ if (*(uintptr_t *)((char *)arena+65568) != (uintptr_t)arena+65536 || *(uintptr_t *)((char *)arena+65576) != (uintptr_t)arena+65536) return 7;
+ printf("PASS generated x64 high arena typed/indexed/modulo32/SSE/RMW/live flags/native SP/full native field stores/stale upper32/source preserved/entire128B redzone/native stack arguments preserved/state-owned arena scratch result=%llu\n",(unsigned long long)result);
+ dasm_free(&d); munmap(code,4096);munmap(arena,131072);return 0;
+}

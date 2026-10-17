@@ -113,6 +113,14 @@ enum GamepadInput { static let keyboardMouseAvailable = true }   // LibraryEntry
 enum LibraryError: LocalizedError { case message(String) }
 func env(_ name: String) -> String? { getenv(name).map { String(cString: $0) } }
 '''
+external_core = (root / 'app/Madeira/ExternalGameLibrary.swift').read_text()
+# Linux keeps the pre-existing Combine boundary: extract only the production
+# Foundation methods used by LibraryEntry, without Darwin/bookmark operations.
+swift += '#if os(Linux)\nenum ExternalGameLibrary {\n'
+swift += block(external_core, '    enum Failure: LocalizedError') + '\n'
+swift += block(external_core, '    static func validateRelative') + '\n'
+swift += block(external_core, '    static func windowsPath(root: UUID') + '\n}\n#else\n'
+swift += external_core + '\n#endif\n'
 swift += block(lib, 'struct LibraryEntry: Codable, Identifiable') + '\n'
 swift += block(lib, 'enum SyncEngine: String, CaseIterable, Identifiable') + '\n'
 swift += '\n'.join(l for l in display.splitlines() if not l.startswith('import ')) + '\n'
@@ -511,7 +519,7 @@ check('__attribute__((weak)) int madeira_dxmt_has_40_cap(void) {\n    return 0;'
       and 'madeira_dxmt_has_40_cap() != 0 && panelMaxFPS >= 120' in fps
       and 'ProMotionIntent.has40Cap || mode == 4' in lib, 'the 40 FPS cap is offered only with DXMT support and a 120 Hz panel')
 check('LibraryView(play: launchLibraryEntry' in content, 'ContentView shows the library when it is the chosen interface')
-check('runWineFullSequence(profile: entry)' in content and 'profile.applyEnvironment()' in content,
+check('runWineFullSequence(profile: entry, preparation: preparation, externalContext: externalContext, epicLaunch: epicLaunch)' in content and 'profile.applyEnvironment()' in content,
       'library launches use the shared launch path with the profile applied')
 check('Button("Use New Interface")' in content, 'the developer interface can switch back to the library')
 loop = bridge.index('for (NSString *raw in [text componentsSeparatedByCharactersInSet:')
@@ -524,7 +532,8 @@ check(0 <= snap < loop and 'getenv(per_launch[i])' not in bridge[loop:bridge.ind
 # ml1184: every switch a game's page exports is one of those keys, and is cleared when the session ends.
 per_launch = set(re.findall(r'"([A-Z0-9_]+)"', block(bridge, 'static const char *const per_launch[] =')))
 exported = set(re.findall(r'setenv\("([A-Z0-9_]+)"', block(lib, 'func applyEnvironment()')))
-ended = bridge[bridge.index('g_wine_running = 0;\n        /* ml1184'):]
+ended = block(bridge, 'static void *wine_process_thread_body(void *arg)')
+ended = ended[ended.index('/* ml1184: these belong to the launch that just ended;'):]
 ended = set(re.findall(r'unsetenv\("([A-Z0-9_]+)"\)', ended[:ended.index('stopping wineserver')]))
 check(exported and exported <= per_launch and per_launch <= ended,
       "ml1184: the per-launch list holds every key applyEnvironment exports, and the session's end unsets them "
@@ -553,11 +562,12 @@ check('ResolutionChoices.groups()' in block(content, 'private var resolutionPick
 check('Picker("Aspect & scaling"' in detail and 'entry.display = $0' in detail, 'game details: Aspect & scaling')
 # The Desktop's details page carries every setting a game's page does. What the Desktop
 # entry leaves out names or starts one particular program: its title and cover, how it
-# starts, its launch arguments, a Home Screen link, its executable. A block gated off
+# starts, its launch arguments, a Home Screen link, its executable and that
+# executable's runtime inspection. A block gated off
 # for the Desktop must be one of those and hold no other control.
 form_body = detail[:detail.index('.navigationTitle("Game details")')]
 desktop_out = ('Section("Library details")', 'Picker("Start"', 'TextField("Launch arguments"',
-               'Text("Home Screen")', 'Section("Executable")')
+               'Text("Home Screen")', 'Section("Executable")', 'Section("运行环境")')
 desktop_controls = {'Picker("Start"', 'Toggle("Start Windows services first"'}
 hidden = []
 for gate in re.finditer(r'\bif\b[^{\n]*(?:entry\.desktop != true|entry\.usesLaunchOptions)[^{\n]*\{', form_body):

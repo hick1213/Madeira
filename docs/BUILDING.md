@@ -80,3 +80,215 @@ rebuild, signing and installation has NOT been performed. Until it is,
 docs/LICENSING.md keeps the relink capability marked unverified. The
 alternative the LGPL offers, shipping the application's object files, is
 not currently done.
+
+## Local build verification (2026-10-10)
+
+A Debug build was compiled, signed and installed on an iPad Pro (M5) with
+Xcode 26.5. This verifies the local build, not a clean-machine rebuild or
+compatibility with every game. Native FEX (including JemallocLibs), LLVM,
+FFmpeg, Wine Unix libraries, DXMT and pairing inputs were built locally.
+The pinned llvm-mingw download and Microsoft x64 redistributable extraction
+were also verified. Preserve the earlier UNVERIFIED labels for steps that
+were not independently repeated from a clean machine.
+
+Steam library UI requires the ignored Dock build outputs, even though its
+owned-games refresh is native and does not start Wine. Before building:
+
+```sh
+bash build/madeira-dock/build.sh --check
+bash build/stage-licenses.sh
+python3 tools/check-app-bundle.py --source --require-steam app/Madeira
+```
+
+For 32-bit support, build `build/wine-i386/build.sh` and retain the aarch64
+WoW64 modules. This local run staged 725 genuine PE32 Wine/DXMT modules.
+MSI requires `msi.dll` and `msiexec.exe`; native DLL dependencies must also
+be staged. Wine Mono is optional .NET Framework support: fetch it with
+`bash build/wine-mono/fetch.sh --source` before a Debug build. It does not
+provide modern CoreCLR. Release keeps its existing on-device Mono download.
+
+After building, check the **built app**, not just the staged inputs:
+
+```sh
+python3 tools/check-app-bundle.py --require-steam --require-wow64 --require-mono --require-msi app/Build/Products/Debug-iphoneos/Madeira.app
+codesign --verify --deep --strict app/Build/Products/Debug-iphoneos/Madeira.app
+```
+
+Select feature flags for the package being shipped. The checker validates PE
+sections/import closure and native iOS images/dependencies; it does not verify
+signing, JIT, downloads, rendering or gameplay. Missing selected features fail
+instead of silently producing a reduced package.
+
+On the local exFAT volume, direct PE linker outputs became corrupt after a
+delay despite initially passing validation. Compile and strip on APFS, then
+stage with ordinary copies and sibling temporary-file renames. The i386
+script accepts absolute `MADEIRA_WINE_I386_BUILD_DIR` and
+`MADEIRA_DXMT_I386_BUILD_DIR` overrides for this purpose. Validate staged
+bytes again after synchronization. Do not enable experimental 64-bit media
+merely because its PE modules are present.
+
+The ARM64EC module script also accepts an absolute APFS build directory:
+
+```sh
+MADEIRA_WINE_PE_BUILD_DIR=/path/on/apfs/wine-build bash build/wine-pe/build-modules.sh xaudio2_8 xaudio2_9
+```
+
+Its default list includes genuine XAudio2 2.7, 2.8 and 2.9 providers; do not
+rename an older provider to satisfy a newer import. The app checker requires
+all three and the bundled FAudio zlib license. The selected modules are linked
+and stripped on APFS before individual temporary copies are renamed into the
+app inputs. Publication is atomic per file, not a transaction for the batch.
+
+### Temporary storage for IPA checks (local workflow)
+
+User requirement, 2026-10-11: ordinary IPA extraction and inspection use the
+external disk, under
+`/Volumes/untitled/github/Madeira/app/Build/Products/IPAInspection/`.
+Create a separate task/build directory there for each run. ZIP inspection,
+CRC, extracted resources, PE/import checks, hashes and inspection reports
+belong there; explicitly set extraction destinations rather than letting a
+temporary-directory default expand the IPA on the internal disk.
+
+Steps that actually require APFS, including the PE linking/stripping above,
+use an explicitly recorded, task-owned directory such as
+`/private/tmp/madeira-apfs-<task>-<random>/` on the internal disk. Check the
+underlying mounted filesystem before use; the external working volume is
+exFAT and the internal Data volume is APFS in the current setup. Do not move
+ordinary inspection to APFS without a concrete filesystem requirement.
+
+When a required APFS step finishes, verify and copy its required outputs,
+hashes and logs to the external task directory, stop/release its processes,
+then promptly remove only that step's recorded temporary directory. If it
+must remain for a running step or failed-run investigation, record the reason
+and pending cleanup. Never delete by a broad `/tmp/madeira*` pattern or remove
+shared build caches, existing IPAs, current build inputs or release evidence
+as part of this cleanup. Preserve an IPA's sealed bytes during inspection;
+removing sealed AppleDouble files requires a separate re-signing workflow.
+
+Keep `$(SDKROOT)/usr/lib` first in the app's library search paths: an inherited
+Homebrew `LIBRARY_PATH` otherwise selects a macOS liblzma during iOS linking.
+Provision an explicit bundle identifier with the increased-memory-limit
+entitlement and authorize the actual destination device before installation.
+
+### CoreCLR memory configuration on iPad
+
+The global `Documents/madeira.cfg` can export .NET runtime settings to every
+launch (a game's own config may override them):
+
+```ini
+env.DOTNET_GCRegionRange = 0x400000000
+env.DOTNET_GCHeapHardLimit = 0x80000000
+```
+
+These hexadecimal values reserve up to 16 GiB of virtual address space for
+GC regions and cap the managed GC heap at 2 GiB. They do not allocate 16 GiB
+of physical RAM or limit the entire Wine process to 2 GiB: native allocations,
+JIT code, graphics and other heaps are separate. Microsoft documents the
+region reservation default of 256 GiB and the distinct heap hard limit at
+https://learn.microsoft.com/en-us/dotnet/core/runtime-config/garbage-collector .
+The local device probe confirmed a 16 GiB reservation succeeds where the
+default failed. Gameplay is still unverified: a later CoreCLR FailFast remains
+under investigation. These values are an explicit device configuration,
+not a universally validated app default or a fix for every runtime failure.
+
+### Pure x64 images and the executable pool
+
+Ordinary AMD64 images are decoded by FEX at their original PE addresses.
+The native protection path now treats those bytes as host data, while retaining
+Wine executable protection metadata and FEX self-modifying-code notifications.
+ARM64 and CHPE/ARM64EC images retain their original executable pool path.
+This prevents a large x64 image from consuming its whole SizeOfImage in the
+native executable pool. Live exported DATA imports from native modules are
+still bound to their native pool storage, including unpooled x64 importers.
+`env.MADEIRA_X64_IMAGE_HOST_DATA = 0` restores the previous image-pool path
+for comparison. This switch does not change anonymous JIT memory handling.
+
+`python3 tests/host/check-x64-image-host-data.py` exercises the production
+classifier and IAT binder using Wine PE layouts under ASan/UBSan, including
+host-page tail bounds and native/hybrid/malformed cases. Native compilation
+also passed. Device compatibility remains subject to the recorded runtime test.
+
+### Default keyed events in child processes
+
+Wine's Unix libraries share one Mach process in this port, but each emulated
+Windows process has its own server handle table. The upstream global default
+keyed-event handle belongs to the initial process. Reusing it in a child can
+make a RunOnce wait fail immediately; its stack waiter node can then be
+republished and corrupt the completion list.
+
+The iOS override resolves NULL keyed-event handles using the current PEB and
+server process ID. It registers the parent's original object and creates one
+child object before child PE execution; explicit handles pass through unchanged.
+Unknown identities and creation failures propagate errors. Socket teardown
+clears the state, while server EOF releases that process's handles.
+
+`tests/x64/runonce-stress.c` is a generic Win32 callback/contention diagnostic,
+with bounded waits and a watchdog. On the local device, the pre-fix executable
+passed 32 rounds with 8 workers when started directly, but failed as an Explorer
+child in the same RunOnce completion instruction. The sanitized host regression
+is `python3 tests/host/check-default-keyed-event.py`. Record the after-fix device
+result separately; the host test alone does not establish successful gameplay.
+
+The after-fix device run of the identical Explorer-child diagnostic completed
+with Windows exit status 0 after the 32 rounds. The original access violation
+was absent. This establishes the child callback/keyed-event regression result;
+it is separate from the subsequent game/rendering validation.
+
+### ARM64EC faultrep provider (2026-10-14)
+
+The default PE rebuild list and source/device package checks now require
+`arm64ec-windows/faultrep.dll`. An i386-only provider does not satisfy an x64
+game import. To rebuild just this stock Wine module, use `JOBS=1`, a task-owned
+APFS `MADEIRA_WINE_PE_BUILD_DIR`, APFS `TMPDIR`, and
+`bash build/wine-pe/build-modules.sh faultrep`. The repository's
+`toolchains/host-tools/bison/3.8.2/bin` can be prepended to command-local PATH
+when the system Bison is too old. Preserve unrelated existing build trees.
+
+App46's runtime repair batch also requires native
+`aarch64-windows/services.exe` and `aarch64-windows/wineboot.exe` (PE machine
+0xaa64). Source and device package checks reject missing, empty, malformed or
+wrong-architecture helpers. These package checks do not prove installer execution
+or guest shutdown on iPad.
+
+App47 also requires `cjk-fonts/NotoSansCJKsc-Regular.otf` and its `LICENSE.txt`.
+The static Noto Sans CJK SC2.004 asset is16,437,364bytes with SHA-256
+`2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b`.
+It is copied with bounded streaming before the server opens the registry;
+no Wine/FEX rebuild is needed. `tests/host/check-runtime-fonts.py` executes the
+actual Foundation migration helper against isolated prefix fixtures.
+
+App48 adds D3D12 dimension/cardinality checks before base/extended allocation
+queries and committed/placed resource creation. Invalid descriptions return an
+error before a Metal call; rejection diagnostics are capped. The focused check is
+`python3 tests/host/check-d3d12-resource-dimensions.py`. This is not complete
+resource-format or device-limit validation, and SOTTR recovery requires device
+evidence.
+
+For a single custom D3D12 PE rebuild, the existing winemetal DLL's exports can
+generate a task-local ARM64EC import library with llvm-dlltool; a full Wine/FEX
+or native DXMT rebuild is unnecessary. Link PE output on internal APFS and copy
+it to the external workspace with buffered writes/fsync and SHA-256 readback:
+the direct external link output in this task became zero-filled despite linker
+success. Validate actual exports/imports, CHPE identity and bundle hashes before
+installation. Evidence: `issue/epic-retry-20261015/sottr-zero-resource/`.
+
+The App45 candidate's inspected DLL has an x64-compatible raw PE machine
+0x8664, is recognized as ARM64EC by LLVM, and exports `ReportFault`. Package
+checks establish presence/architecture; device loading and game compatibility
+still require the user's launch. See the
+[log/throughput report](../issue/epic-retry-20261014/game-logs-epic-perf/REPORT.md).
+
+### SDL3 compatibility asset
+
+`arm64ec-windows/madeira-steam-components/SDL3.dll` is built independently from
+unmodified official SDL source commit `b1362f8a427b32e01df19b48c8dd4b6599d6cc6d`.
+Use the pinned source archive/hash in
+`issue/epic-retry-20261015/steam-sdl3-preload/component.json`; configure CMake for
+Windows with the repository LLVM/MinGW x86_64 C/C++/windres tools, Release,
+SDL_SHARED=ON, SDL_STATIC=OFF, SDL_TEST_LIBRARY=OFF, SDL_TESTS=OFF,
+SDL_EXAMPLES=OFF and SDL_REVISION=SDL-release-3.4.0-98-gb1362f8a4. Build target
+SDL3-shared with `--parallel 1`, then strip on internal APFS. Repin the checked
+artifact hash/revision in `madeira-dock/src/sdl_component_pin.h` before rebuilding
+Dock; bundle its SDL/HIDAPI/LLVM/MinGW notices. Never replace the user's root
+32-bit SDL file. Verify the host/DLL hashes again after resource copying.
+The component's actual on-device initialization is a separate validation gate.

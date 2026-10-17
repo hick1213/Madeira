@@ -3,6 +3,7 @@
 // Madeira Converter Exception: see LICENSE-EXCEPTION.md
 
 import SwiftUI
+import Combine
 
 /// State of the Madeira Dock sheet: sign-in, Valve's client components, the
 /// installed games and the last Dock result.
@@ -25,22 +26,50 @@ final class MadeiraDockModel: ObservableObject {
     @Published private(set) var installRunNext: [Int: Bool] = [:]
 
     private var watch: Task<Void, Never>?
+    private var scan: Task<Void, Never>?
+    private var scanIdentity: UUID?
+    private var scanDeferred = false
+    private var workObserver: AnyCancellable?
+
+    private init() {
+        workObserver = GameSessionWork.shared.$pausesBackgroundWork.dropFirst().sink { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                if GameSessionWork.shared.pausesBackgroundWork {
+                    if self.scan != nil { self.scanDeferred = true; self.scan?.cancel() }
+                } else if self.scanDeferred { self.scanDeferred = false; self.refresh() }
+            }
+        }
+    }
 
     func refresh() {
+        let work = GameSessionWork.shared, epoch = work.workEpoch
+        guard !work.pausesBackgroundWork else { scanDeferred = true; return }
+        guard scan == nil else { scanDeferred = true; return }
         clientInstalled = MadeiraDock.clientInstalled
         let drive = MadeiraDock.drive, prefix = MadeiraDock.prefix
-        Task.detached(priority: .userInitiated) {
+        let identity = UUID(); scanIdentity = identity
+        scan = Task.detached(priority: .utility) {
             let found = MadeiraDock.games(drive: drive)
             var programs: [Int: Int] = [:], runNext: [Int: Bool] = [:]
             if DockInstallers.choiceEnabled {
                 let ledger = DockInstallLedger.load(prefix: prefix)
                 for game in found where game.installed {
+                    if Task.isCancelled { break }
                     let count = DockInstallers.programCount(game, drive: drive)
                     if count > 0 { programs[game.id] = count; runNext[game.id] = ledger.runsNext(game.id) }
                 }
             }
             let counts = programs, choices = runNext
-            await MainActor.run { self.games = found; self.installPrograms = counts; self.installRunNext = choices }
+            let cancelled = Task.isCancelled
+            await MainActor.run {
+                guard self.scanIdentity == identity else { return }
+                self.scan = nil; self.scanIdentity = nil
+                if !cancelled, !work.pausesBackgroundWork, work.workEpoch == epoch {
+                    self.games = found; self.installPrograms = counts; self.installRunNext = choices
+                } else { self.scanDeferred = true }
+                if self.scanDeferred, !work.pausesBackgroundWork { self.scanDeferred = false; self.refresh() }
+            }
         }
     }
 

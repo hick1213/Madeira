@@ -700,6 +700,9 @@ struct SteamSettingsSection: View {
             } else {
                 Button { open(.steamSignIn) } label: { Label("Sign in to Steam", systemImage: "person.crop.circle.badge.plus") }
             }
+            if SteamOwnedLibrary.enabled {
+                Button { open(.steamDownloadSource) } label: { Label("Download source", systemImage: "network") }
+            }
             if MadeiraDock.enabled {
                 Button { open(.dock) } label: { Label("Madeira Dock", systemImage: "shippingbox") }
                 if let status = dock.status {

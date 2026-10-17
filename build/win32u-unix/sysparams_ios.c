@@ -186,12 +186,16 @@ static struct monitor virtual_monitor =
 /* The size of the virtual monitor -- the single monitor this port reports
  * (lock_display_devices always takes the virtual-monitor branch here).
  *
- * Two values, not one:
+ * Three values:
  *
  *  - the SESSION DEFAULT, which the app publishes in MADEIRA_SCREEN_W/H
  *    before the first guest thread runs (MADEIRA_SCREEN_SRC names where it
- *    came from). ChangeDisplaySettings(NULL,0) and CDS_RESET restore it,
- *    exactly as they restore the registry mode on Windows.
+ *    came from). It remains the cap for the advertised mode list.
+ *
+ *  - the REGISTRY mode, initially the session default, then the last mode
+ *    saved with CDS_UPDATEREGISTRY. CDS_NORESET saves without applying it;
+ *    a NULL mode applies this saved value. This virtual state is session
+ *    local and does not override the app's next-launch resolution setting.
  *
  *  - the CURRENT mode, which is whatever a guest last selected through
  *    ChangeDisplaySettings(Ex). A mode request used to be accepted and
@@ -201,15 +205,21 @@ static struct monitor virtual_monitor =
  *    and ios_publish_screen_size() pushes a change out to everything that
  *    mirrors the size, including the app's presented surface.
  *
- * ios_screen_size() is called with display_lock held (monitor_get_rect,
- * lock_display_devices), so it must never take a lock of its own; the two
- * ints are written once by a mode change and read as single words.
+ * ios_screen_size() is called with display_lock held. The state mutex is
+ * therefore released before any mode publication takes display_lock or
+ * sends messages, so current/registry dimension pairs cannot be torn and
+ * no inverse lock order is introduced.
  */
 static int ios_screen_cur_w, ios_screen_cur_h;
 static int ios_screen_def_w, ios_screen_def_h;
+static int ios_screen_reg_w, ios_screen_reg_h;
+static pthread_mutex_t ios_screen_state_lock = PTHREAD_MUTEX_INITIALIZER;
+static UINT64 ios_screen_epoch;
+static BOOL ios_screen_publishing, ios_screen_publish_pending, ios_screen_pending_broadcast;
 
 static void ios_screen_size( int *w, int *h )
 {
+    pthread_mutex_lock( &ios_screen_state_lock );
     if (!ios_screen_cur_w)
     {
         /* MADEIRA_SCREEN_W/H: the virtual monitor's session default size,
@@ -225,11 +235,14 @@ static void ios_screen_size( int *w, int *h )
         ios_screen_def_h = sh;
         ios_screen_cur_w = sw;
         ios_screen_cur_h = sh;
+        ios_screen_reg_w = sw;
+        ios_screen_reg_h = sh;
         dprintf( STDERR_FILENO, "[display] virtual monitor %dx%d (source=%s)\n", sw, sh,
                  (src && *src) ? src : ((we && he) ? "env" : "default") );
     }
     *w = ios_screen_cur_w;
     *h = ios_screen_cur_h;
+    pthread_mutex_unlock( &ios_screen_state_lock );
 }
 #endif
 
@@ -3832,6 +3845,10 @@ static BOOL source_mode_exists( const DISPLAYCONFIG_MODE_INFO *modes, UINT32 mod
     return FALSE;
 }
 
+#ifdef WINE_IOS
+static BOOL ios_virtual_enum_display_settings( DWORD index, DEVMODEW *devmode, DWORD flags );
+#endif
+
 /***********************************************************************
  *              NtUserQueryDisplayConfig (win32u.@)
  */
@@ -3846,11 +3863,14 @@ LONG WINAPI NtUserQueryDisplayConfig( UINT32 flags, UINT32 *paths_count, DISPLAY
     DEVMODEW devmode;
     struct monitor *monitor;
     DWORD retrieve_flags = flags & qdc_retrieve_flags_mask;
+#ifdef WINE_IOS
+    LUID virtual_luid;
+#endif
 
     TRACE( "flags %#x, paths_count %p, paths %p, modes_count %p, modes %p, topology_id %p.\n",
            flags, paths_count, paths, modes_count, modes, topology_id );
 
-    if (!paths_count || !modes_count)
+    if (!paths_count || !modes_count || !paths || !modes)
         return ERROR_INVALID_PARAMETER;
 
     if (!*paths_count || !*modes_count)
@@ -3888,18 +3908,30 @@ LONG WINAPI NtUserQueryDisplayConfig( UINT32 flags, UINT32 *paths_count, DISPLAY
     LIST_FOR_EACH_ENTRY( monitor, &monitors, struct monitor, entry )
     {
         if (!is_monitor_active( monitor )) continue;
-        if (!monitor->source) continue;
-
-        source_index = monitor->source->id;
-        gpu_luid = &monitor->source->gpu->luid;
         output_id = monitor->output_id;
 
         memset( &devmode, 0, sizeof(devmode) );
         devmode.dmSize = sizeof(devmode);
-        if (!source_get_current_settings( monitor->source, &devmode ))
+        if (monitor->source)
         {
-            goto done;
+            source_index = monitor->source->id;
+            gpu_luid = &monitor->source->gpu->luid;
+            if (!source_get_current_settings( monitor->source, &devmode )) goto done;
         }
+#ifdef WINE_IOS
+        else if (monitor == &virtual_monitor)
+        {
+            /* The virtual monitor has no source object, but it is the active
+             * DISPLAY1 returned by GDI. CCD must describe that same display
+             * instead of reporting success with zero paths after BufferSizes
+             * advertised one. Keep the LUID used by DXGI and the Metal GPU. */
+            if (!madeira_kmt_adapter_luid( &virtual_luid ) ||
+                !ios_virtual_enum_display_settings( ENUM_CURRENT_SETTINGS, &devmode, 0 )) goto done;
+            source_index = 0;
+            gpu_luid = &virtual_luid;
+        }
+#endif
+        else continue;
 
         if (path_index == *paths_count || mode_index == *modes_count)
         {
@@ -3936,6 +3968,10 @@ LONG WINAPI NtUserQueryDisplayConfig( UINT32 flags, UINT32 *paths_count, DISPLAY
                                   flags, &devmode );
         }
         else set_path_target_info( &paths[path_index].targetInfo, gpu_luid, output_id, mode_index, ~0u, flags, &devmode );
+#ifdef WINE_IOS
+        if (monitor == &virtual_monitor)
+            paths[path_index].targetInfo.outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL;
+#endif
         ++mode_index;
 
         set_path_source_info( &paths[path_index].sourceInfo, gpu_luid, source_index, source_mode_index, flags );
@@ -4119,14 +4155,24 @@ static BOOL ios_virtual_enum_display_settings( DWORD index, DEVMODEW *devmode, D
 
     if (index == ENUM_CURRENT_SETTINGS || index == ENUM_REGISTRY_SETTINGS)
     {
+        static unsigned int logged;
+        BOOL log;
+
+        pthread_mutex_lock( &ios_screen_state_lock );
+        if (index == ENUM_REGISTRY_SETTINGS)
+        {
+            sw = ios_screen_reg_w;
+            sh = ios_screen_reg_h;
+        }
+        else sw = ios_screen_cur_w, sh = ios_screen_cur_h;
+        log = logged < 4;
+        if (log) logged++;
+        pthread_mutex_unlock( &ios_screen_state_lock );
         devmode->dmPelsWidth = sw;
         devmode->dmPelsHeight = sh;
-        {
-            static int logged;
-            if (logged++ < 4)
-                dprintf(2, "[vmode] synthesized %s = %dx%d\n",
-                        index == ENUM_CURRENT_SETTINGS ? "CURRENT" : "REGISTRY", sw, sh);
-        }
+        if (log)
+            dprintf(2, "[vmode] synthesized %s = %dx%d\n",
+                    index == ENUM_CURRENT_SETTINGS ? "CURRENT" : "REGISTRY", sw, sh);
         return TRUE;
     }
     if (index == WINE_ENUM_PHYSICAL_SETTINGS) return FALSE;
@@ -4197,20 +4243,56 @@ static void ios_invalidate_work_area(void);   /* below, beside the spi_loaded ca
 static void ios_publish_screen_size( BOOL broadcast )
 {
     int w, h;
+    UINT64 epoch;
 
-    ios_screen_size( &w, &h );
-    update_display_cache( TRUE );
-    ios_invalidate_work_area();
-    NtUserClipCursor( NULL );
+    ios_screen_size( &w, &h );  /* initialize the session before taking the state mutex */
+    pthread_mutex_lock( &ios_screen_state_lock );
+    /* A mode change queues its request while committing CURRENT, before
+     * unlocking. The startup-only publication has no such commit. */
+    if (!broadcast) ios_screen_publish_pending = TRUE;
+    if (ios_screen_publishing || !ios_screen_publish_pending)
+    {
+        pthread_mutex_unlock( &ios_screen_state_lock );
+        return;
+    }
+    ios_screen_publishing = TRUE;
 
-    if (winios_display_mode_changed) winios_display_mode_changed( w, h );
+    for (;;)
+    {
+        w = ios_screen_cur_w;
+        h = ios_screen_cur_h;
+        epoch = ios_screen_epoch;
+        broadcast = ios_screen_pending_broadcast;
+        ios_screen_publish_pending = FALSE;
+        ios_screen_pending_broadcast = FALSE;
+        pthread_mutex_unlock( &ios_screen_state_lock );
 
-    if (!broadcast) return;
+        update_display_cache( TRUE );
+        ios_invalidate_work_area();
+        NtUserClipCursor( NULL );
 
-    send_notify_message( get_desktop_window(), WM_DISPLAYCHANGE, 32, MAKELPARAM( w, h ), FALSE );
-    send_message_timeout( HWND_BROADCAST, WM_DISPLAYCHANGE, 32, MAKELPARAM( w, h ),
-                          SMTO_ABORTIFHUNG, 2000, FALSE );
-    NtUserPostMessage( NtUserGetForegroundWindow(), WM_WINE_CLIPCURSOR, SET_CURSOR_FSCLIP, 0 );
+        if (winios_display_mode_changed) winios_display_mode_changed( w, h );
+
+        if (broadcast)
+        {
+            send_notify_message( get_desktop_window(), WM_DISPLAYCHANGE, 32, MAKELPARAM( w, h ), FALSE );
+            send_message_timeout( HWND_BROADCAST, WM_DISPLAYCHANGE, 32, MAKELPARAM( w, h ),
+                                  SMTO_ABORTIFHUNG, 2000, FALSE );
+            NtUserPostMessage( NtUserGetForegroundWindow(), WM_WINE_CLIPCURSOR, SET_CURSOR_FSCLIP, 0 );
+        }
+
+        pthread_mutex_lock( &ios_screen_state_lock );
+        /* Never leave an older snapshot as the final UI size. Concurrent
+         * callers and synchronous WM_DISPLAYCHANGE re-entry queue work,
+         * rather than waiting for a mutex held across another window's
+         * callback. Also catch a commit whose caller has not reached this
+         * function yet; its CURRENT pair and epoch were committed together. */
+        if (epoch != ios_screen_epoch)
+            ios_screen_publish_pending = ios_screen_pending_broadcast = TRUE;
+        if (!ios_screen_publish_pending) break;
+    }
+    ios_screen_publishing = FALSE;
+    pthread_mutex_unlock( &ios_screen_state_lock );
 }
 
 /* The session default has to be published too, once, for the same cursor-clip
@@ -4262,8 +4344,9 @@ static int ios_virtual_mode_set_enabled(void)
  * Windows, and the app scales the new desktop to the view. Reject a mode
  * that is not in the list with BADMODE and an unknown device with BADPARAM --
  * never BADPARAM for our own device name. A NULL devmode, and a request
- * that names no size, restore the session default, which is this port's
- * equivalent of the registry mode. */
+ * that names no size, apply the last saved registry mode. Keep this state
+ * within the current Wine session; per-game next-launch defaults remain
+ * owned by the app. */
 static LONG ios_virtual_change_display_settings( UNICODE_STRING *devname, const DEVMODEW *devmode,
                                                  DWORD flags )
 {
@@ -4271,20 +4354,25 @@ static LONG ios_virtual_change_display_settings( UNICODE_STRING *devname, const 
     LONG ret = DISP_CHANGE_SUCCESSFUL;
     const char *why = "no mode requested";
     int sw, sh, want_w = 0, want_h = 0;
-    BOOL apply = FALSE;
+    BOOL apply = FALSE, publish = FALSE;
 
     ios_screen_size( &sw, &sh );
+    pthread_mutex_lock( &ios_screen_state_lock );
+    sw = ios_screen_cur_w;
+    sh = ios_screen_cur_h;
 
     if (!ios_virtual_device_name( devname )) ret = DISP_CHANGE_BADPARAM, why = "unknown device name";
+    else if ((flags & CDS_NORESET) && !(flags & CDS_UPDATEREGISTRY))
+        ret = DISP_CHANGE_BADFLAGS, why = "NORESET requires UPDATEREGISTRY";
     else if (!devmode || !(devmode->dmFields & size_fields))
     {
         /* ChangeDisplaySettings(NULL, 0) -- and any call that names no size --
-         * means "go back to the registry mode", which here is the size the
-         * session started at. */
-        want_w = ios_screen_def_w;
-        want_h = ios_screen_def_h;
+         * means "apply the saved registry mode", including a deferred
+         * CDS_UPDATEREGISTRY | CDS_NORESET request. */
+        want_w = ios_screen_reg_w;
+        want_h = ios_screen_reg_h;
         apply = !(flags & (CDS_TEST | CDS_NORESET));
-        why = "restoring the session default";
+        why = "applying the saved registry mode";
     }
     else if ((devmode->dmFields & size_fields) == size_fields)
     {
@@ -4316,18 +4404,29 @@ static LONG ios_virtual_change_display_settings( UNICODE_STRING *devname, const 
             why = apply ? "mode accepted" : "mode supported (test/noreset)";
         }
     }
+    else ret = DISP_CHANGE_BADMODE, why = "mode is missing a resolution field";
 
-    if (apply && (want_w != sw || want_h != sh))
+    if (ret == DISP_CHANGE_SUCCESSFUL && !(flags & CDS_TEST) && (flags & CDS_UPDATEREGISTRY))
+    {
+        ios_screen_reg_w = want_w;
+        ios_screen_reg_h = want_h;
+    }
+
+    if (apply && (want_w != sw || want_h != sh || (flags & CDS_RESET)))
     {
         if (!ios_virtual_mode_set_enabled()) why = "mode accepted, not programmed (MADEIRA_VIRTUAL_MODE_SET=0)";
         else
         {
             ios_screen_cur_w = want_w;
             ios_screen_cur_h = want_h;
-            ios_publish_screen_size( TRUE );
+            ios_screen_epoch++;
+            ios_screen_publish_pending = ios_screen_pending_broadcast = TRUE;
+            publish = TRUE;
             why = "mode programmed";
         }
     }
+    pthread_mutex_unlock( &ios_screen_state_lock );
+    if (publish) ios_publish_screen_size( TRUE );
 
     dprintf( STDERR_FILENO,
              "[iOS ChangeDisplaySettings] virtual display %dx%d: req=%lux%lu flags=%#x -> %d (%s)\n",
@@ -4344,6 +4443,15 @@ static void monitor_get_interface_name( struct monitor *monitor, WCHAR *interfac
     const char *id;
 
     *interface_name = 0;
+#ifdef WINE_IOS
+    if (monitor == &virtual_monitor && !monitor->source)
+    {
+        snprintf( buffer, sizeof(buffer), "\\\\?\\DISPLAY#Default_Monitor#4&madeira&0&UID0#%s",
+                  guid_devinterface_monitorA );
+        asciiz_to_unicode( interface_name, buffer );
+        return;
+    }
+#endif
     if (!monitor->source) return;
 
     if (!(monitor->edid_info.flags & MONITOR_INFO_HAS_MONITOR_ID)) id = "Default_Monitor";
@@ -8516,6 +8624,69 @@ ULONG_PTR WINAPI NtUserCallTwoParam( ULONG_PTR arg1, ULONG_PTR arg2, ULONG code 
     }
 }
 
+#ifdef WINE_IOS
+/* display_lock held; callers have checked the type-specific packet size. */
+static BOOL ios_virtual_display_device_info( DISPLAYCONFIG_DEVICE_INFO_HEADER *packet, NTSTATUS *ret )
+{
+    LUID luid;
+    UINT id = packet->type == DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME ? 0 : virtual_monitor.output_id;
+    char buffer[MAX_PATH];
+
+    if (list_head( &monitors ) != &virtual_monitor.entry || virtual_monitor.source ||
+        (packet->type != DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME && packet->id != id) ||
+        !madeira_kmt_adapter_luid( &luid ) ||
+        memcmp( &packet->adapterId, &luid, sizeof(luid) )) return FALSE;
+
+    switch (packet->type)
+    {
+    case DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME:
+    {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME *name = (DISPLAYCONFIG_SOURCE_DEVICE_NAME *)packet;
+        asciiz_to_unicode( name->viewGdiDeviceName, "\\\\.\\DISPLAY1" );
+        break;
+    }
+    case DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME:
+    {
+        DISPLAYCONFIG_TARGET_DEVICE_NAME *name = (DISPLAYCONFIG_TARGET_DEVICE_NAME *)packet;
+        memset( &name->flags, 0, sizeof(*name) - offsetof(DISPLAYCONFIG_TARGET_DEVICE_NAME, flags) );
+        name->outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL;
+        snprintf( buffer, sizeof(buffer), "Display%u", virtual_monitor.output_id + 1 );
+        asciiz_to_unicode( name->monitorFriendlyDeviceName, buffer );
+        monitor_get_interface_name( &virtual_monitor, name->monitorDevicePath );
+        break;
+    }
+    case DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE:
+    {
+        DISPLAYCONFIG_TARGET_PREFERRED_MODE *preferred = (DISPLAYCONFIG_TARGET_PREFERRED_MODE *)packet;
+        DISPLAYCONFIG_MODE_INFO mode = {0};
+        DEVMODEW devmode = {.dmSize = sizeof(devmode)};
+        if (!ios_virtual_enum_display_settings( ENUM_CURRENT_SETTINGS, &devmode, 0 )) return FALSE;
+        set_mode_target_info( &mode, &luid, virtual_monitor.output_id, QDC_ONLY_ACTIVE_PATHS, &devmode );
+        preferred->width = devmode.dmPelsWidth;
+        preferred->height = devmode.dmPelsHeight;
+        preferred->targetMode = mode.targetMode;
+        break;
+    }
+    case DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME:
+    {
+        DISPLAYCONFIG_ADAPTER_NAME *name = (DISPLAYCONFIG_ADAPTER_NAME *)packet;
+        struct madeira_kmt_identity identity;
+        unsigned int i;
+        madeira_kmt_identity( &identity );
+        snprintf( buffer, ARRAY_SIZE(name->adapterDevicePath), "\\\\?\\%s\\%s", identity.path,
+                  guid_devinterface_display_adapterA );
+        for (i = 4; buffer[i]; i++) if (buffer[i] == '\\') buffer[i] = '#';
+        asciiz_to_unicode( name->adapterDevicePath, buffer );
+        break;
+    }
+    default:
+        return FALSE;
+    }
+    *ret = STATUS_SUCCESS;
+    return TRUE;
+}
+#endif
+
 /***********************************************************************
  *           NtUserDisplayConfigGetDeviceInfo    (win32u.@)
  */
@@ -8543,6 +8714,13 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
 
         if (!lock_display_devices( FALSE )) return STATUS_UNSUCCESSFUL;
 
+#ifdef WINE_IOS
+        if (ios_virtual_display_device_info( packet, &ret ))
+        {
+            unlock_display_devices();
+            return ret;
+        }
+#endif
         LIST_FOR_EACH_ENTRY(source, &sources, struct source, entry)
         {
             if (source_name->header.id != source->id) continue;
@@ -8570,10 +8748,18 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
 
         if (!lock_display_devices( FALSE )) return STATUS_UNSUCCESSFUL;
 
+#ifdef WINE_IOS
+        if (ios_virtual_display_device_info( packet, &ret ))
+        {
+            unlock_display_devices();
+            return ret;
+        }
+#endif
         memset( &target_name->flags, 0, sizeof(*target_name) - offsetof(DISPLAYCONFIG_TARGET_DEVICE_NAME, flags) );
 
         LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
         {
+            if (!monitor->source) continue;
             if (target_name->header.id != monitor->output_id) continue;
             if (memcmp( &target_name->header.adapterId, &monitor->source->gpu->luid,
                         sizeof(monitor->source->gpu->luid) ))
@@ -8617,10 +8803,18 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
 
         if (!lock_display_devices( FALSE )) return STATUS_UNSUCCESSFUL;
 
+#ifdef WINE_IOS
+        if (ios_virtual_display_device_info( packet, &ret ))
+        {
+            unlock_display_devices();
+            return ret;
+        }
+#endif
         memset( &preferred_mode->width, 0, sizeof(*preferred_mode) - offsetof(DISPLAYCONFIG_TARGET_PREFERRED_MODE, width) );
 
         LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
         {
+            if (!monitor->source) continue;
             if (preferred_mode->header.id != monitor->output_id) continue;
             if (memcmp( &preferred_mode->header.adapterId, &monitor->source->gpu->luid,
                         sizeof(monitor->source->gpu->luid) ))
@@ -8695,6 +8889,13 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
 
         if (!lock_display_devices( FALSE )) return STATUS_UNSUCCESSFUL;
 
+#ifdef WINE_IOS
+        if (ios_virtual_display_device_info( packet, &ret ))
+        {
+            unlock_display_devices();
+            return ret;
+        }
+#endif
         LIST_FOR_EACH_ENTRY(source, &sources, struct source, entry)
         {
             if (memcmp( &adapter_name->header.adapterId, &source->gpu->luid, sizeof(source->gpu->luid) )) continue;
@@ -8726,6 +8927,7 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
 
         LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
         {
+            if (!monitor->source) continue;
             if (color_info->header.id != monitor->output_id) continue;
             if (memcmp( &color_info->header.adapterId, &monitor->source->gpu->luid,
                         sizeof(monitor->source->gpu->luid) ))

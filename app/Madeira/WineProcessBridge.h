@@ -14,6 +14,12 @@ int wine_process_start(const char *prefix_path);
 // Check if Wine process is running
 int wine_process_is_running(void);
 
+// One-use Epic arguments, copied into memory and consumed by the next launch.
+// They never enter MADEIRA_ARGS, game profiles or generated scripts. Passing
+// NULL clears a pending launch; Steam's existing argument path is unchanged.
+int wine_epic_prepare_launch(const char *arguments_json, const char *exchange_code, const char *expected_exe);
+void wine_epic_clear_launch(void);
+
 // Session exit report (the library front end). ntdll calls
 // wine_launched_process_did_exit() when the program the app launched (the
 // session's initial process) exits; other processes are not reported.

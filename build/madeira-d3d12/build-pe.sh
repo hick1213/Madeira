@@ -11,6 +11,7 @@ MINGW="$REPO_ROOT/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin"
 SRC="$REPO_ROOT/madeira-d3d12/src/pe"
 TESTS="$REPO_ROOT/madeira-d3d12/tests/windows"
 OUT="${OUT:-$REPO_ROOT/build/madeira-d3d12/out-pe}"
+WINEMETAL_LIB_DIR="${WINEMETAL_LIB_DIR:-$REPO_ROOT/dxmt/build-arm64ec/src/winemetal}"
 mkdir -p "$OUT"
 
 # Regenerate the stub tables so a toolchain header update cannot silently leave
@@ -23,7 +24,7 @@ echo "=== madeira_d3d12.dll (arm64ec) ==="
 "$MINGW/arm64ec-w64-mingw32-clang" -shared -O2 -Wall \
     -o "$OUT/madeira_d3d12.dll" "$SRC/madeira_d3d12.c" "$SRC/d3d12.def" \
     -I"$SRC" -I"$REPO_ROOT/madeira-d3d12/src" -I"$REPO_ROOT/dxmt/src/winemetal" \
-    -L"$REPO_ROOT/dxmt/build-arm64ec/src/winemetal" -lwinemetal \
+    -L"$WINEMETAL_LIB_DIR" -lwinemetal \
     -luuid -lole32
 echo "  built $(ls -l "$OUT/madeira_d3d12.dll" | awk '{print $5}') bytes"
 # The same binary also ships as d3d12.dll (ml849): the engine reaches it through
@@ -52,3 +53,7 @@ echo "=== d3d12-cube-x64.exe (x86_64 guest, visible) ==="
 "$MINGW/x86_64-w64-mingw32-clang" -O2 -Wall -mwindows \
     -o "$OUT/d3d12-cube-x64.exe" "$TESTS/cube_window.c" -I"$TESTS" -luuid -lole32
 echo "  built $(ls -l "$OUT/d3d12-cube-x64.exe" | awk '{print $5}') bytes"
+
+# The DirectComposition Device1 bridge is a real PE DLL and follows the same
+# explicit output-only build contract; bundling/installing is a separate step.
+OUT="$OUT" MINGW="$MINGW" bash "$DIR/build-dcomp.sh"

@@ -11,6 +11,31 @@ Steam sign-in and asks the client to start the game with Valve's own
 check. The game, its Steam API calls and any DRM run exactly as Valve ships
 them.
 
+## Separate SDL compatibility component
+
+The 64-bit host preloads a separately built AMD64 SDL3 component before Valve's
+unchanged client. It uses the same upstream revision as the pinned Steam root
+SDL, `SDL-release-3.4.0-98-gb1362f8a4` (commit
+`b1362f8a427b32e01df19b48c8dd4b6599d6cc6d`); the original root PE32 file is
+retained. This component is an independent upstream build, not a Valve binary.
+
+After user profiles are applied, the native bridge overwrites or clears
+`MADEIRA_SDL3_COMPONENT_PATH` from its own app bundle. The host accepts only the
+exact protected app-bundle namespace and loads that backing file rather than
+the mutable Wine-prefix symlink. It checks the PE type, SHA-256 and runtime
+revision with restricted loader flags, retaining the successful module for the
+client lifetime. No DLL search policy, Steam authentication or ownership gate
+changes. Numeric `sdl-component-stage`/`sdl-component-error` report the outcome.
+
+The stripped DLL is 3,022,848 bytes, SHA-256
+`90378528c4b2084137a85cd7a6dfa4536738d806f202339a44c61bee262ec23f`.
+Portable ASAN/UBSAN, native asset-selection/report fixtures and both PE builds
+pass. All 428 direct imports resolve against bundled Wine exports (including
+API-set mappings and forwarders). Actual loading, optional dynamic imports,
+SDL initialization and game compatibility still require device evidence.
+See [build evidence](../issue/epic-retry-20261015/steam-sdl3-preload/component.json)
+and the submodule's `docs/HANDOFF.md`.
+
 ## What it is not
 
 - Not a Steam emulator, not a DRM bypass, no ticket forging, no game patches.
@@ -44,7 +69,14 @@ them.
     exception, the GPL text and the LLVM/MinGW-w64 runtime notices).
 
   Both are build outputs and are gitignored. `--check` also runs Dock's own
-  unit tests. Without a built `dockhost.exe`, Madeira shows no Dock button.
+  unit tests. Without a built `dockhost.exe`, Madeira shows no Dock button. The
+  Steam library section is also gated by the bundled host: a successful
+  account sign-in alone does not make it appear. Run
+  `python3 tools/check-app-bundle.py --source --require-steam app/Madeira`
+  before building, and repeat without `--source` against the built app.
+  Both host and notices must be present. Owned-games refresh itself uses
+  Madeira's native Steam connection and does not need JIT or Valve's client.
+  Starting through Dock still requires the on-device client download below.
 
 ## Using it
 
@@ -160,7 +192,9 @@ arguments are not supported.
    A Dock launch sets `MADEIRA_DOCK_SESSION=1` and the bridge leaves the three
    unset (`[steam-env] Madeira Dock session: ...`); Valve's client gives the
    game its own. `env.MADEIRA_DOCK_CLEAR_STEAM_ID = 0` keeps the fixed identity.
-5. **The report.** Dock writes numeric stages to `C:\madeira-dock.txt`.
+5. **The report.** Each app launch gives Dock a unique
+   `C:\madeira-dock-<session UUID>.txt` path through `MADEIRA_STEAM_HOST_LOG`;
+   the standalone host's default remains `C:\madeira-dock.txt`.
    Madeira reads only whitelisted numeric fields and the 64-hex client
    fingerprint (never other guest text), logs changes as `[dock-report]`,
    and turns the final `probe-result` into a message. Covered: unsupported
@@ -171,6 +205,10 @@ arguments are not supported.
    `session-callback-ids` (numbers only), with `session-requested-app-entitled`
    and `session-subscription-count`, so a sign-in that never reaches the
    licence check can be told apart from one whose licences never arrive.
+   After this session has reported its game running, game ended, Steam
+   shutdown complete and a final result, the app asks the owning Wine desktop
+   to close. The request is bound to the native session generation; the app
+   waits for actual Wine/server cleanup before returning to the library.
 6. **Another session.** If Valve's client refuses the launch with 35 (Steam
    still counts the account as playing in another session, which also
    happens for a session that ended without telling Steam until its old

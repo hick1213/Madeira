@@ -259,7 +259,7 @@ the switch is only consulted for a WoW64 process, window or thread.
 | `MADEIRA_STRICT_SPLITLOCK` | on | FEX WOW64 | `StrictInProcessSplitLocks` default for 32-bit guests (an explicit FEX setting wins) |
 | `MADEIRA_WOW_SYSCALL_SWEEP` | on | FEX WOW64 | Let the code-buffer sweeper move threads parked in a system call |
 | `MADEIRA_D3D9` | unset (emulated) | i386 `d3d9.dll` | `native`: the D3D9 shim uses the native ARM64 frontend. Also set by the `d3d9` key of `madeira.cfg` |
-| `MADEIRA_WOW_RWX_PLAIN` | unset (automatic) | 32-bit | Anonymous RWX memory in a window is plain read/write to the host once Wine Mono's `libmono-2.0-x86.dll` is mapped there; 1: in every window, 0: never (stores go through the JIT pool's alias, as before; also keeps FEX's Mono bridge off) |
+| `MADEIRA_WOW_RWX_PLAIN` | on | 32-bit | Anonymous x86 RWX memory inside a known live 32-bit guest window is host read/write data; EC code, section/file/image views and existing JIT aliases keep their separate paths. 0 disables this window rule; the older odd-size anonymous-data rule still applies. Wine Mono detection is diagnostic, not a prerequisite. |
 | `MADEIRA_WINEMONO_BRIDGE` | automatic for `libmono-2.0-x86.dll` | FEX WOW64 | FEX's Mono backpatcher bridge (ml712) and, once it finds the backpatcher, SMC detection off for the process (ml1280); 0 keeps both off. The 64-bit runtime still needs 1 |
 | `MADEIRA_MONO_DEFAULTS` | on | Wine Mono | mscoree sets `MONO_THREADS_SUSPEND=coop` and adds `keep-delegates` to `MONO_DEBUG` before Mono loads; values already set win; 0 sets nothing |
 

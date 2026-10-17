@@ -29,8 +29,11 @@
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
+#include "EpicLogFilter.h"
+#include <poll.h>
 #include "PrefixExtractor.h"
 #include "FEXBridge.h"  // fex_get_jit_write_offset()
+#include "../../build/ntdll-unix/ios_native_lifetime.h"
 
 // Thread-local globals for wine_ios_exit longjmp (used by wine_ios_exit.h shim in ntdll)
 // Each Wine "process" thread has its own jmpbuf so child processes can exit independently.
@@ -48,6 +51,22 @@ static os_log_t wine_proc_log(void) {
 }
 
 #define LOG(fmt, ...) os_log(wine_proc_log(), "[WineProc] " fmt, ##__VA_ARGS__)
+
+/* Native-owned asset, reset after every profile application before Wine snapshots
+ * the process environment. The host verifies its PE identity, hash and revision. */
+static int madeira_set_sdl_component_path(NSString *bundlePath)
+{
+    unsetenv("MADEIRA_SDL3_COMPONENT_PATH");
+    if (!bundlePath.length) return 0;
+    NSString *bundle = bundlePath.stringByResolvingSymlinksInPath;
+    NSString *expected = [bundle stringByAppendingPathComponent:@"arm64ec-windows/madeira-steam-components/SDL3.dll"];
+    NSString *path = expected.stringByResolvingSymlinksInPath;
+    if (![path isEqualToString:expected]) return 0;
+    NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:path error:NULL];
+    unsigned long long size = [attributes[NSFileSize] unsignedLongLongValue];
+    if (![attributes[NSFileType] isEqualToString:NSFileTypeRegular] || size < 64 || size > 16 * 1024 * 1024) return 0;
+    return setenv("MADEIRA_SDL3_COMPONENT_PATH", path.fileSystemRepresentation, 1) == 0;
+}
 
 /* ---- ml581: undo the hand-made AppData skeleton ------------------------
  *
@@ -290,6 +309,100 @@ extern void wine_log_set_file(const char *path);
 
 static pthread_t g_wine_thread;
 static volatile int g_wine_running = 0;
+
+static pthread_mutex_t g_epic_launch_lock = PTHREAD_MUTEX_INITIALIZER;
+static NSArray<NSString *> *g_epic_launch_arguments;
+static NSString *g_epic_launch_secret;
+static NSString *g_epic_launch_exe;
+static int g_epic_log_restore = -1, g_epic_log_stop = -1;
+static dispatch_group_t g_epic_log_group;
+
+void wine_epic_clear_launch(void) {
+    pthread_mutex_lock(&g_epic_launch_lock);
+    g_epic_launch_arguments = nil; g_epic_launch_secret = nil; g_epic_launch_exe = nil;
+    pthread_mutex_unlock(&g_epic_launch_lock);
+}
+int wine_epic_prepare_launch(const char *json, const char *secret, const char *expectedExe) {
+    wine_epic_clear_launch();
+    if (!json || !secret || !expectedExe || !*expectedExe || strnlen(expectedExe,1025)>1024 || __atomic_load_n(&g_wine_running, __ATOMIC_ACQUIRE)) return -1;
+    if (strnlen(json, 32769) > 32768 || strnlen(secret, 257) > 256 || strlen(secret) < 16) return -1;
+    NSData *data = [[NSString stringWithUTF8String:json] dataUsingEncoding:NSUTF8StringEncoding];
+    id values = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+    if (![values isKindOfClass:[NSArray class]] || [values count] > 64) return -1;
+    size_t bytes = 0;
+    for (id value in values) {
+        if (![value isKindOfClass:[NSString class]]) return -1;
+        const char *text = [value UTF8String];
+        size_t length = [value lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+        if (!text || length != strlen(text) || length > 4096) return -1;
+        bytes += length + 1;
+        if (bytes > 16384) return -1;
+    }
+    pthread_mutex_lock(&g_epic_launch_lock);
+    g_epic_launch_arguments = [values copy];
+    g_epic_launch_secret = [NSString stringWithUTF8String:secret];
+    g_epic_launch_exe = [NSString stringWithUTF8String:expectedExe];
+    pthread_mutex_unlock(&g_epic_launch_lock);
+    return 0;
+}
+
+static int madeira_epic_redirect_log(const char *path, NSString *secret) {
+    int output = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600), pipes[2], control[2];
+    if (output < 0) return 0;
+    if (pipe(pipes)) { close(output); return 0; }
+    if (pipe(control)) { close(output); close(pipes[0]); close(pipes[1]); return 0; }
+    int restore = dup(output);
+    MadeiraEpicRedactor *state = malloc(sizeof(*state));
+    if (restore < 0 || !state || !madeira_epic_redactor_init(state, secret.UTF8String)) {
+        free(state); close(output); close(pipes[0]); close(pipes[1]); close(control[0]); close(control[1]); if (restore>=0) close(restore); return 0;
+    }
+    if (dup2(pipes[1], STDERR_FILENO) < 0 || dup2(pipes[1], STDOUT_FILENO) < 0) {
+        dup2(output, STDERR_FILENO); dup2(output, STDOUT_FILENO);
+        free(state); close(output); close(pipes[0]); close(pipes[1]); close(control[0]); close(control[1]); close(restore); return 0;
+    }
+    close(pipes[1]);
+    int input = pipes[0];
+    int stop = control[0];
+    fcntl(input, F_SETFL, O_NONBLOCK);
+    dispatch_group_t group = dispatch_group_create();
+    pthread_mutex_lock(&g_epic_launch_lock);
+    g_epic_log_restore = restore; g_epic_log_stop = control[1]; g_epic_log_group = group;
+    pthread_mutex_unlock(&g_epic_launch_lock);
+    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        unsigned char buffer[8192];
+        int writing = 1, stopping = 0;
+        for (;;) {
+            struct pollfd watches[2] = {{input,POLLIN,0},{stop,POLLIN,0}};
+            int ready = poll(watches, 2, -1);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0) break;
+            if (watches[1].revents) stopping = 1;
+            ssize_t n = read(input, buffer, sizeof(buffer));
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == EAGAIN) { if (stopping) break; else continue; }
+            if (n <= 0) break;
+            // A full disk must not strand stdout/stderr without a reader.
+            // Continue draining and discard; never fall back to raw output.
+            if (writing && !madeira_epic_redactor_write(state, output, buffer, (size_t)n, 0)) writing = 0;
+        }
+        if (writing) madeira_epic_redactor_write(state, output, NULL, 0, 1);
+        memset(state, 0, sizeof(*state)); free(state); close(input); close(output); close(stop);
+    });
+    return 1;
+}
+
+static void madeira_epic_end_log(void) {
+    pthread_mutex_lock(&g_epic_launch_lock);
+    int restore = g_epic_log_restore, stop = g_epic_log_stop;
+    dispatch_group_t group = g_epic_log_group;
+    g_epic_log_restore = -1; g_epic_log_stop = -1; g_epic_log_group = nil;
+    pthread_mutex_unlock(&g_epic_launch_lock);
+    if (restore < 0) return;
+    fflush(stdout); fflush(stderr);
+    dup2(restore, STDERR_FILENO); dup2(restore, STDOUT_FILENO); close(restore);
+    if (stop >= 0) { char done = 1; (void)write(stop, &done, 1); close(stop); }
+    if (group) dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 2*NSEC_PER_SEC));
+}
 
 /* Session exit report for the library front end. The app marks one process as
  * its own: the program it hands to __wine_main below, which is the session's
@@ -835,8 +948,55 @@ static void madeira_publish_host_probe(void)
     dprintf(STDERR_FILENO, "[WineProc] FEX host feature probe: %s\n", buf);
 }
 
-static void *wine_process_thread(void *arg) {
+static void wine_process_clear_foreign_teb_slot(void) {
+    /* The mirror now belongs to ntdll's allocated pthread key. Its native
+     * owner knows whether the key exists; raw slot 275 belongs to Apple. */
+    extern void ios_clear_thread_teb_mirror(void);
+    ios_clear_thread_teb_mirror();
+}
+
+static _Thread_local int wine_session_finish_started;
+
+static void wine_process_finish_session(void) {
+    sigset_t mask, previous;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGQUIT);
+    pthread_sigmask(SIG_BLOCK, &mask, &previous);
+    if (wine_session_finish_started) {
+        pthread_sigmask(SIG_SETMASK, &previous, NULL);
+        return;
+    }
+    wine_session_finish_started = 1;
+    ios_native_retire_current();
+    wineserver_stop();
+    wine_process_clear_foreign_teb_slot();
+    dprintf(STDERR_FILENO, "[WineProc] Wine process thread finished cleanly\n");
+    /* The lifetime observer publishes completion after this native thread's
+     * autorelease pool and TLS destructors, all Wine workers and child cleanup.
+     * Returning here is not enough to let the library start a new session. */
+    pthread_sigmask(SIG_SETMASK, &previous, NULL);
+}
+
+static void wine_process_native_complete(void *peb, uint64_t generation) {
+    extern void ios_jit_finish_process(void *, uint64_t);
+    ios_jit_finish_process(peb, generation);
+    madeira_epic_end_log();
+    __atomic_store_n(&g_wine_running, 0, __ATOMIC_RELEASE);
+}
+
+static void *wine_process_thread_body(void *arg) {
+    (void)arg;
     @autoreleasepool {
+        pthread_mutex_lock(&g_epic_launch_lock);
+        NSArray<NSString *> *epicArguments = g_epic_launch_arguments;
+        NSString *epicSecret = g_epic_launch_secret;
+        NSString *epicExe = g_epic_launch_exe;
+        g_epic_launch_arguments = nil; g_epic_launch_secret = nil; g_epic_launch_exe = nil;
+        pthread_mutex_unlock(&g_epic_launch_lock);
+        if (epicExe && (!getenv("MADEIRA_EXE") || strcmp(epicExe.UTF8String, getenv("MADEIRA_EXE")))) {
+            dprintf(STDERR_FILENO, "[epic] launch target changed; game not started\n");
+            wine_process_finish_session(); return NULL;
+        }
         /* Perf: the guest main thread runs ON this pthread. Promote to
          * USER_INTERACTIVE so it schedules on P-cores with minimal kernel
          * timer coalescing (same rationale as start_thread in
@@ -1228,6 +1388,8 @@ static void *wine_process_thread(void *arg) {
             }
         }
 
+        madeira_set_sdl_component_path([[NSBundle mainBundle] bundlePath]);
+
         // Steam S0: root CA trust. iOS has no API to enumerate system
         // roots, so crypt32's unix rootstore (crypt32_unixlib_ios.c)
         // reads the bundled Mozilla CA set from this path instead.
@@ -1246,11 +1408,22 @@ static void *wine_process_thread(void *arg) {
         {
             NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
             NSString *logPath2 = [docs stringByAppendingPathComponent:@"madeira-log.txt"];
-            int logfd = open(logPath2.UTF8String, O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (logfd >= 0) {
-                dup2(logfd, STDERR_FILENO);
-                dup2(logfd, STDOUT_FILENO);
-                close(logfd);
+            if (epicSecret) {
+                // Covers Wine debug and guest printf as well as bridge argv.
+                if (!madeira_epic_redirect_log(logPath2.UTF8String, epicSecret)) {
+                    dprintf(STDERR_FILENO, "[epic] secure launch log setup failed; game not started\n");
+                    wine_process_finish_session(); return NULL;
+                }
+                // server_ios duplicates its messages to FILE* in addition to
+                // stderr; stderr is now the sole persistent Epic log writer.
+                wine_log_set_file("/dev/null");
+            } else {
+                int logfd = open(logPath2.UTF8String, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                if (logfd >= 0) {
+                    dup2(logfd, STDERR_FILENO);
+                    dup2(logfd, STDOUT_FILENO);
+                    close(logfd);
+                }
             }
         }
 
@@ -1258,6 +1431,10 @@ static void *wine_process_thread(void *arg) {
         // Set MADEIRA_EXE=hello-x64.exe in env to launch the ARM64EC test path.
         const char *madeira_exe = getenv("MADEIRA_EXE");
         if (!madeira_exe || !*madeira_exe) madeira_exe = "cube.exe";
+        if (epicExe && strcmp(epicExe.UTF8String, madeira_exe)) {
+            dprintf(STDERR_FILENO, "[epic] configured launch target changed; game not started\n");
+            wine_process_finish_session(); return NULL;
+        }
         // Heuristic: x86_64 guest exes (cube-x64, hello-x64, real games like
         // Thumper) need the arm64ec-windows bundle (ARM64EC hybrid system
         // DLLs that interop with FEX-translated x86_64 code). ARM64-native
@@ -1548,6 +1725,10 @@ static void *wine_process_thread(void *arg) {
                 *w++ = 0;
             }
         }
+        if (epicArguments) {
+            extra_argc = 0;
+            for (NSString *value in epicArguments) extra_argv[extra_argc++] = (char *)value.UTF8String;
+        }
 
         char *argv[72];
         int argc = 0;
@@ -1557,8 +1738,9 @@ static void *wine_process_thread(void *arg) {
         argv[argc] = NULL;
         dprintf(STDERR_FILENO, "[WineProc] argv[1] = %s\n", exe_path);
         for (int i = 0; i < extra_argc; i++) {
-            dprintf(STDERR_FILENO, "[WineProc] argv[%d] = %s\n", 2 + i, extra_argv[i]);
+            if (!epicArguments) dprintf(STDERR_FILENO, "[WineProc] argv[%d] = %s\n", 2 + i, extra_argv[i]);
         }
+        if (epicArguments) dprintf(STDERR_FILENO, "[epic] %d authenticated arguments supplied in memory\n", extra_argc);
 
         /* iOS-Madeira: chdir to the unix path that maps to the exe's Wine
          * directory BEFORE __wine_main. Wine inherits the iOS app sandbox
@@ -1685,7 +1867,6 @@ static void *wine_process_thread(void *arg) {
             }
         }
 
-        g_wine_running = 0;
         /* ml1184: these belong to the launch that just ended; a later session in this app
          * run gets its own from its game, or madeira.cfg's. */
         unsetenv("MADEIRA_FASTSYNC"); unsetenv("MADEIRA_FASTSYNC_SEM");
@@ -1697,28 +1878,32 @@ static void *wine_process_thread(void *arg) {
 
         // Stop wineserver to prevent CPU spin (iOS kills for excessive CPU)
         dprintf(STDERR_FILENO, "[WineProc] stopping wineserver...\n");
-        wineserver_stop();
-
-        dprintf(STDERR_FILENO, "[WineProc] Wine process thread finished cleanly\n");
-
-        // Steam S0: this thread's TEB was mirrored into pthread TSD slot
-        // 275 (FEX's hardcoded 0x898) which we don't own via
-        // pthread_key_create. Returning from a pthread runs foreign key
-        // destructors on whatever's in the slot -> objc_release(TEB)
-        // crash wedged the app after every net-test run. Clear it, same
-        // as ntdll's pthread_exit_wrapper does for Wine worker threads.
-        {
-            uintptr_t tsd_base;
-            __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
-            tsd_base &= ~7ULL;
-            *(void **)(tsd_base + 275 * 8) = NULL;
-        }
+        wine_process_finish_session();
     }
     return NULL;
 }
 
+
+static void wine_process_native_cleanup(void *unused) {
+    (void)unused;
+    wine_process_finish_session();
+}
+
+static void *wine_process_thread(void *arg) {
+    if (!ios_native_publish(arg, NULL)) {
+        wineserver_stop();
+        return NULL;
+    }
+    /* A sibling can terminate this bootstrap through SIGQUIT/pthread_exit.
+     * Keep server shutdown and owned TLS cleanup on that path as well. */
+    pthread_cleanup_push(wine_process_native_cleanup, NULL);
+    wine_process_thread_body(NULL);
+    pthread_cleanup_pop(1);
+    return NULL;
+}
+
 int wine_process_start(const char *prefix_path) {
-    if (g_wine_running) {
+    if (__atomic_load_n(&g_wine_running, __ATOMIC_ACQUIRE)) {
         LOG("Wine process already running");
         return 0;
     }
@@ -1728,15 +1913,16 @@ int wine_process_start(const char *prefix_path) {
 
     LOG("Starting Wine process with prefix: %{public}s", prefix_path);
 
-    g_wine_running = 1;
+    __atomic_store_n(&g_wine_running, 1, __ATOMIC_RELEASE);
 
     // Create socketpair to bypass broken iOS UDS accept()
     // pair[0] = wineserver side (injected as client fd)
     // pair[1] = ntdll side (used as fd_socket)
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == -1) {
+        wine_epic_clear_launch();
         LOG("socketpair failed: %{public}s", strerror(errno));
-        g_wine_running = 0;
+        __atomic_store_n(&g_wine_running, 0, __ATOMIC_RELEASE);
         return -1;
     }
     LOG("socketpair created: server_fd=%d, client_fd=%d", pair[0], pair[1]);
@@ -1760,13 +1946,16 @@ int wine_process_start(const char *prefix_path) {
     pthread_attr_init(&attr);
     pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
 
-    int ret = pthread_create(&g_wine_thread, &attr, wine_process_thread, NULL);
+    struct ios_native_reservation *nativeReservation = ios_native_process_reserve(wine_process_native_complete);
+    int ret = nativeReservation ? pthread_create(&g_wine_thread, &attr, wine_process_thread, nativeReservation) : ENOMEM;
     pthread_attr_destroy(&attr);
     if (ret != 0) {
+        if (nativeReservation) ios_native_creation_failed(nativeReservation);
+        wine_epic_clear_launch();
         LOG("Failed to create Wine process thread: %d", ret);
         close(pair[0]);
         close(pair[1]);
-        g_wine_running = 0;
+        __atomic_store_n(&g_wine_running, 0, __ATOMIC_RELEASE);
         return -1;
     }
 
@@ -1776,7 +1965,7 @@ int wine_process_start(const char *prefix_path) {
 }
 
 int wine_process_is_running(void) {
-    return g_wine_running;
+    return __atomic_load_n(&g_wine_running, __ATOMIC_ACQUIRE);
 }
 
 int madeira_write_continue_flag(void) {

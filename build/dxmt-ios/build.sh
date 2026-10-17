@@ -15,6 +15,16 @@ SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 OBJ_DIR="$BUILD_DIR/obj"
 OUT_LIB="$BUILD_DIR/libdxmt_unix.a"
 
+LLVM_ARCHIVES=()
+for component in $(sed -n '/^llvm_deps = \[/,/^\]/p' "$DXMT_SRC/airconv/meson.build" | grep -oE -- '-lLLVM[A-Za-z0-9]+'); do
+    archive="$LLVM_BUILD/lib/lib${component#-l}.a"
+    [ -s "$archive" ] || { echo "ERROR: missing LLVM archive $archive; build the pinned iOS LLVM dependencies first" >&2; exit 1; }
+    LLVM_ARCHIVES+=("$archive")
+done
+[ "${#LLVM_ARCHIVES[@]}" -gt 0 ] || { echo "ERROR: missing LLVM component list in airconv/meson.build" >&2; exit 1; }
+[ -s "$LLVM_BUILD/include/llvm/Config/llvm-config.h" ] || \
+    { echo "ERROR: missing LLVM generated headers in $LLVM_BUILD/include" >&2; exit 1; }
+
 mkdir -p "$OBJ_DIR"
 
 COMMON_FLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=18.0 -fblocks -O2"
@@ -24,6 +34,36 @@ INCLUDES_SHADERS="-I$BUILD_DIR/shader-headers"
 LLVM_INCLUDES="-I$LLVM_BUILD/include -I$LLVM_SRC/include"
 AIRCONV_DEFS="-D_FILE_OFFSET_BITS=64 -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS"
 CXX_FLAGS="-std=c++20 -fno-exceptions -fno-rtti"
+
+# airconv_context.cpp includes these generated AIR bitcode arrays. The
+# upstream meson chain embeds .air directly (not a linked .metallib).
+mkdir -p "$BUILD_DIR/shader-headers"
+for shader in air_msad air_samplepos air_tessellation; do
+    input="$DXMT_SRC/airconv/shaders/$shader.metal"
+    output="$BUILD_DIR/shader-headers/$shader.h"
+    if [ ! -s "$output" ] || [ "$input" -nt "$output" ] || [ "$0" -nt "$output" ]; then
+        compile_input="$input"
+        if [ "$shader" = air_tessellation ]; then
+            # The private builtin's signature changed in newer Metal tools.
+            # Keep the fork untouched; adapt only the exact known call to
+            # the public threadgroup atomic API with the same relaxed order.
+            compile_input="$BUILD_DIR/shader-headers/$shader.metal"
+            python3 - "$input" "$compile_input" <<'PY'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+old = '__metal_atomic_fetch_add_explicit(out_count, 1, int(memory_order_relaxed), __METAL_MEMORY_SCOPE_THREADGROUP__)'
+new = 'atomic_fetch_add_explicit((threadgroup atomic_int *)out_count, 1, memory_order_relaxed)'
+if source.count(old) != 1:
+    raise SystemExit('ERROR: unrecognized air_tessellation atomic call; review the Metal adapter')
+Path(sys.argv[2]).write_text(source.replace(old, new))
+PY
+        fi
+        xcrun -sdk macosx metal -std=metal3.1 --target=air64-apple-macos14.0 \
+            -o "$BUILD_DIR/shader-headers/$shader.air" -c "$compile_input"
+        xxd -n "$shader" -i "$BUILD_DIR/shader-headers/$shader.air" "$output"
+    fi
+done
 
 # MADEIRA (WOW64_DESIGN.md section 8, `dxmt_madeira_native`): the D3D9
 # frontend and its DXMT substrate, compiled as NATIVE iOS-arm64 code into this
@@ -56,9 +96,11 @@ MADEIRA_WARNINGS="-Wno-unused-parameter -Wno-missing-field-initializers \
 SUCCEEDED=0
 FAILED=0
 FAILED_FILES=""
+ACTIVE_OBJECTS=()
 
 compile_objc() {
     local src=$1 name=$2
+    ACTIVE_OBJECTS+=("$OBJ_DIR/$name.o")
     # MADEIRA_ONLY=<name>: recompile one object only.
     if [ -n "${MADEIRA_ONLY:-}" ] && [ "$name" != "$MADEIRA_ONLY" ]; then return 0; fi
     printf "  %-40s " "$name"
@@ -72,6 +114,7 @@ compile_objc() {
 
 compile_cxx() {
     local src=$1 name=$2 extra="${3:-}"
+    ACTIVE_OBJECTS+=("$OBJ_DIR/$name.o")
     # MADEIRA_ONLY=<name>: recompile one object only.
     if [ -n "${MADEIRA_ONLY:-}" ] && [ "$name" != "$MADEIRA_ONLY" ]; then return 0; fi
     printf "  %-40s " "$name"
@@ -86,6 +129,8 @@ compile_cxx() {
 # MADEIRA: the native D3D9 frontend and its substrate (section 8.10 step 1).
 compile_madeira_cxx() {
     local src=$1 name=$2 extra="${3:-}"
+    ACTIVE_OBJECTS+=("$OBJ_DIR/$name.o")
+    if [ -n "${MADEIRA_ONLY:-}" ] && [ "$name" != "$MADEIRA_ONLY" ]; then return 0; fi
     printf "  %-40s " "$name"
     if xcrun -sdk iphoneos clang++ $COMMON_FLAGS $MADEIRA_CXX_FLAGS $MADEIRA_WARNINGS \
         $MADEIRA_INCLUDES $INCLUDES_DIRECTX $INCLUDES_SHADERS $MADEIRA_DEFS $extra \
@@ -98,6 +143,8 @@ compile_madeira_cxx() {
 
 compile_madeira_c() {
     local src=$1 name=$2 extra="${3:-}"
+    ACTIVE_OBJECTS+=("$OBJ_DIR/$name.o")
+    if [ -n "${MADEIRA_ONLY:-}" ] && [ "$name" != "$MADEIRA_ONLY" ]; then return 0; fi
     printf "  %-40s " "$name"
     if xcrun -sdk iphoneos clang $COMMON_FLAGS -std=c11 $MADEIRA_WARNINGS \
         $MADEIRA_INCLUDES $INCLUDES_DIRECTX $INCLUDES_SHADERS $MADEIRA_DEFS $extra \
@@ -114,6 +161,7 @@ compile_madeira_c() {
 # and the DXMT build must not start failing when it is absent.
 compile_objcxx_arc() {
     local src=$1 name=$2 extra="${3:-}"
+    ACTIVE_OBJECTS+=("$OBJ_DIR/$name.o")
     # MADEIRA_ONLY=<name>: recompile one object only.
     if [ -n "${MADEIRA_ONLY:-}" ] && [ "$name" != "$MADEIRA_ONLY" ]; then return 0; fi
     printf "  %-40s " "$name"
@@ -196,6 +244,8 @@ compile_cxx "$DXMT_SRC/airconv/transforms/lower_16bit_texread.cpp" lower_16bit_t
 echo "=== DXBCParser (uses exceptions — override) ==="
 for cpp in BlobContainer.cpp DXBCUtils.cpp ShaderBinary.cpp; do
     name=dxbc_$(basename "$cpp" .cpp)
+    ACTIVE_OBJECTS+=("$OBJ_DIR/$name.o")
+    if [ -n "${MADEIRA_ONLY:-}" ] && [ "$name" != "$MADEIRA_ONLY" ]; then continue; fi
     # ShaderBinary uses `throw`, so we can't use -fno-exceptions from CXX_FLAGS.
     printf "  %-40s " "$name"
     if xcrun -sdk iphoneos clang++ $COMMON_FLAGS -std=c++20 -fno-rtti \
@@ -308,24 +358,25 @@ if [ -n "$FAILED_FILES" ]; then
     echo "See .err files in $OBJ_DIR/"
     exit 1
 fi
+for object in "${ACTIVE_OBJECTS[@]}"; do
+    [ -s "$object" ] || { echo "ERROR: missing active object $object; run a full build before MADEIRA_ONLY" >&2; exit 1; }
+done
+printf '%s\n' "${ACTIVE_OBJECTS[@]}" > "$OBJ_DIR/active-objects.txt"
 
 echo ""
 echo "=== Archiving libdxmt_unix.a ==="
-xcrun -sdk iphoneos ar rcs "$OUT_LIB" "$OBJ_DIR"/*.o
+xcrun -sdk iphoneos ar rcs "$OUT_LIB.tmp.$$" "${ACTIVE_OBJECTS[@]}"
+mv "$OUT_LIB.tmp.$$" "$OUT_LIB"
 echo "Built: $OUT_LIB ($(wc -c < "$OUT_LIB" | tr -d ' ') bytes)"
 
-# The app links libdxmt_combined.a (this unix side merged with the LLVM archives
-# airconv needs), NOT libdxmt_unix.a. Refreshing only the latter is how a change
-# here reaches nothing: the app would keep linking the previous objects and the
-# build would look clean. Replace our members in place and re-index.
+# The app links DXMT merged with the pinned LLVM dependencies. Recreate the
+# combined archive so a first build also stages it and obsolete members from
+# an earlier configuration cannot survive an incremental update.
 COMBINED="$BUILD_DIR/libdxmt_combined.a"
-if [ -f "$COMBINED" ]; then
-    echo "=== Refreshing libdxmt_combined.a ==="
-    xcrun -sdk iphoneos ar r "$COMBINED" "$OBJ_DIR"/*.o
-    xcrun -sdk iphoneos ranlib "$COMBINED"
-    echo "Refreshed: $COMBINED ($(wc -c < "$COMBINED" | tr -d ' ') bytes)"
-    APP_COPY="$REPO_ROOT/app/Madeira/libdxmt_combined.a"
-    if [ -f "$APP_COPY" ]; then cp "$COMBINED" "$APP_COPY"; echo "Staged: $APP_COPY"; fi
-else
-    echo "NOTE: $COMBINED absent; the app links that file, so build it before deploying."
-fi
+echo "=== Building libdxmt_combined.a ==="
+xcrun -sdk iphoneos libtool -static -o "$COMBINED.tmp" "${ACTIVE_OBJECTS[@]}" "${LLVM_ARCHIVES[@]}"
+mv "$COMBINED.tmp" "$COMBINED"
+APP_COPY="$REPO_ROOT/app/Madeira/libdxmt_combined.a"
+cp "$COMBINED" "$APP_COPY.tmp.$$"
+mv "$APP_COPY.tmp.$$" "$APP_COPY"
+echo "Staged: $APP_COPY ($(wc -c < "$APP_COPY" | tr -d ' ') bytes)"

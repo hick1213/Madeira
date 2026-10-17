@@ -22,6 +22,7 @@
 #define WINIOS_DRV_H
 
 #include "WiniosGamepad.h"
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -76,6 +77,11 @@ int winios_compositor_set_hidden(int hidden);
  * session start clears the overlay. */
 void winios_note_game_metal_hwnd(void *hwnd);
 void winios_session_reset(void);
+/* Independent native Wine-start token. A reliable once-only close request
+ * is delivered by the actual desktop owner's Wine event pump; no foreground
+ * fallback, broadcast, shutdown API or UI-only finish. */
+uint64_t winios_control_session_token(void);
+int winios_request_desktop_close(uint64_t generation);
 int winios_desktop_point_from_window(double wx, double wy, int *px, int *py);
 
 /* Top-level window census, for the starting screen of a Madeira Dock start

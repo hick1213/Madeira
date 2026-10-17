@@ -504,7 +504,9 @@ static void set_process_name( const char *name )
 #endif
     if ((p = strrchr( name, '\\' ))) name = p + 1;
     if ((p = strrchr( name, '/' ))) name = p + 1;
-#ifdef HAVE_SETPROGNAME
+#if defined(HAVE_SETPROGNAME) && !defined(WINE_IOS)
+    /* Darwin borrows this pointer. An iOS guest's argv may live on its
+     * launcher thread's stack; it must not rename the shared host process. */
     setprogname( name );
 #endif
 #ifdef HAVE_PRCTL

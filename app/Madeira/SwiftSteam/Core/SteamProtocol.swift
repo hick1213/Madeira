@@ -50,6 +50,7 @@ enum EMsg: UInt32 {
 
 /// Unified-service methods.
 enum SteamServiceMethod: String {
+    case getContentServers = "ContentServerDirectory.GetServersForSteamPipe#1"
     case getManifestRequestCode = "ContentServerDirectory.GetManifestRequestCode#1"
     case getCDNAuthToken = "ContentServerDirectory.GetCDNAuthToken#1"
     /// The account's own playtime and last-played times.
@@ -63,6 +64,10 @@ enum SteamServiceMethod: String {
     case cloudClientBeginFileUpload = "Cloud.ClientBeginFileUpload#1"
     case cloudClientCommitFileUpload = "Cloud.ClientCommitFileUpload#1"
     case cloudCompleteAppUploadBatch = "Cloud.CompleteAppUploadBatchBlocking#1"
+
+    func acceptsServiceResult(_ result: Int32) -> Bool {
+        self != .getContentServers || result == 1
+    }
 }
 
 // MARK: - Result codes
